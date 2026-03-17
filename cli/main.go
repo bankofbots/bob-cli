@@ -175,10 +175,12 @@ func dashboardOriginFromAPIBase(base string) string {
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	switch {
 	case strings.HasPrefix(host, "api-"):
-		// api-testnet.bankofbots.ai → testnet.bankofbots.ai (env-prefixed subdomain)
+		// api-testnet.bobscore.ai → testnet.bobscore.ai (env-prefixed subdomain)
 		host = strings.TrimPrefix(host, "api-")
+	case host == "api.bobscore.ai":
+		// api.bobscore.ai → bobscore.ai
+		return u.Scheme + "://bobscore.ai"
 	case strings.HasPrefix(host, "api."):
-		// api.bankofbots.ai → app.bankofbots.ai
 		host = "app." + strings.TrimPrefix(host, "api.")
 	case host == "localhost" || host == "127.0.0.1":
 		return u.Scheme + "://localhost:3000"
