@@ -730,10 +730,10 @@ func ensureRailsAvailable(caps *systemRailCapabilities, currency, destinationTyp
 }
 
 var creditTierMultipliers = map[string]float64{
-	"trusted":  1.5,
-	"growing":  1.2,
-	"building": 1.0,
-	"watch":    0.6,
+	"Trusted":     1.5,
+	"Established": 1.2,
+	"Verified":    1.0,
+	"Unverified":  0.6,
 }
 
 
@@ -753,16 +753,16 @@ func fetchOperatorCreditContext(agentID string) (map[string]any, error) {
 	tier := func(raw any) string {
 		counts, ok := raw.(map[string]any)
 		if !ok {
-			return "building"
+			return "Verified"
 		}
-		for _, t := range []string{"trusted", "growing", "building"} {
+		for _, t := range []string{"Trusted", "Established", "Verified"} {
 			if v, ok2 := counts[t]; ok2 {
 				if n, ok3 := v.(float64); ok3 && n > 0 {
 					return t
 				}
 			}
 		}
-		return "building"
+		return "Verified"
 	}(summary["tier_counts"])
 	multiplier := creditTierMultipliers[tier]
 	if multiplier == 0 {
