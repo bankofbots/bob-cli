@@ -1368,6 +1368,7 @@ func main() {
 	root.PersistentFlags().StringVar(&apiKey, "api-key", apiKeyDefault, "API key for authentication (or set BOB_API_KEY)")
 
 	root.AddCommand(initCmd())
+	root.AddCommand(registerCmd())
 	root.AddCommand(doctorCmd())
 	root.AddCommand(configCmd())
 	root.AddCommand(authCmd())
@@ -1447,6 +1448,117 @@ func initSwitchPlatform(cmd *cobra.Command, args []string) error {
 			{Command: "bob doctor", Description: "Verify CLI config and connectivity"},
 			{Command: "bob auth me", Description: "Verify current identity with active API URL"},
 		},
+	})
+	return nil
+}
+
+func registerCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "register",
+		Short: "Self-register a new agent (no existing API key required)",
+		RunE:  registerAgent,
+	}
+	cmd.Flags().String("email", "", "Operator email address (required)")
+	cmd.Flags().String("name", "", "Agent name (optional; server will generate one if omitted)")
+	cmd.Flags().String("platform", defaultPlatform, "Output style hint (generic, openclaw, claude)")
+	cmd.Flags().String("api-url", apiBase, "API base URL (host root or /api/v1)")
+	cmd.MarkFlagRequired("email")
+	return cmd
+}
+
+func registerAgent(cmd *cobra.Command, args []string) error {
+	email, _ := cmd.Flags().GetString("email")
+	name, _ := cmd.Flags().GetString("name")
+	platform, _ := cmd.Flags().GetString("platform")
+	apiURLFlag, _ := cmd.Flags().GetString("api-url")
+
+	email = strings.TrimSpace(email)
+	name = strings.TrimSpace(name)
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	if platform == "" {
+		platform = "generic"
+	}
+	if !validPlatform(platform) {
+		emitError("bob register", fmt.Errorf("--platform must be one of: generic, openclaw, claude"))
+		return nil
+	}
+
+	normalizedAPIBase := normalizeAPIBaseForEnv(apiURLFlag)
+
+	// Temporarily swap apiBase so apiPostNoAuth targets the right host.
+	previousBase := apiBase
+	apiBase = normalizedAPIBase
+	defer func() { apiBase = previousBase }()
+
+	payload := map[string]any{"email": email, "platform": platform}
+	if name != "" {
+		payload["agent_name"] = name
+	}
+
+	resp, err := apiPostNoAuth("/agents/register", payload)
+	if err != nil {
+		emitError("bob register", err)
+		return nil
+	}
+
+	var reg struct {
+		AgentID    string   `json:"agent_id"`
+		APIKey     string   `json:"api_key"`
+		OperatorID string   `json:"operator_id"`
+		Status     string   `json:"status"`
+		Message    string   `json:"message"`
+		NextActions []struct {
+			Command     string `json:"command"`
+			Description string `json:"description"`
+		} `json:"next_actions"`
+	}
+	if err := json.Unmarshal(resp, &reg); err != nil {
+		emitError("bob register", fmt.Errorf("failed to parse registration response: %w", err))
+		return nil
+	}
+	if strings.TrimSpace(reg.APIKey) == "" || strings.TrimSpace(reg.AgentID) == "" {
+		emitError("bob register", fmt.Errorf("registration did not return api_key and agent_id"))
+		return nil
+	}
+
+	// Persist credentials to config (same approach as bob init).
+	warnings := []string{}
+	if err := persistCLIConfig(normalizedAPIBase, platform); err != nil {
+		warnings = append(warnings, "failed to persist local CLI config: "+err.Error())
+	}
+	if primaryPath := cliConfigPath(); primaryPath != fallbackCLIConfigPath() {
+		if credCfg, loadErr := loadCLIConfig(); loadErr == nil {
+			credCfg.APIKey = reg.APIKey
+			credCfg.AgentID = reg.AgentID
+			if writeErr := writeCLIConfig(primaryPath, credCfg); writeErr != nil {
+				warnings = append(warnings, "failed to persist credentials to config: "+writeErr.Error())
+			}
+		}
+	}
+
+	nextActions := []NextAction{
+		{Command: "bob auth me", Description: "Verify your key and role"},
+		{Command: "bob doctor", Description: "Show active API URL + auth/config status"},
+		{Command: fmt.Sprintf("bob agent get %s", reg.AgentID), Description: "Inspect agent details"},
+	}
+
+	data := map[string]any{
+		"agent_id":    reg.AgentID,
+		"api_key":     reg.APIKey,
+		"operator_id": reg.OperatorID,
+		"status":      reg.Status,
+		"message":     reg.Message,
+		"config_file": activeCLIConfigPath(),
+	}
+	if len(warnings) > 0 {
+		data["warnings"] = warnings
+	}
+
+	emit(Envelope{
+		OK:          true,
+		Command:     "bob register",
+		Data:        data,
+		NextActions: nextActions,
 	})
 	return nil
 }
