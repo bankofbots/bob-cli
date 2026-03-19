@@ -17,7 +17,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.1.0"
+const version = "0.6.1"
 
 const defaultAPIBase = "http://localhost:8080/api/v1"
 
@@ -736,7 +736,6 @@ var creditTierMultipliers = map[string]float64{
 	"Unverified":  0.6,
 }
 
-
 func fetchOperatorCreditContext(agentID string) (map[string]any, error) {
 	path := "/operators/me/credit?days=30"
 	if strings.TrimSpace(agentID) != "" {
@@ -1140,46 +1139,52 @@ func commandTree() CommandInfo {
 					},
 					{
 						Name:        "credit-import",
-						Description: "Import a historical BTC payment proof to build credit reputation",
-						Usage:       "bob agent credit-import <agent-id> [--txid <txid> | --payment-hash <hash> | --proof-type <type> --proof-ref <ref>] --amount <sats>",
+						Description: "Import a historical on-chain payment proof to build credit reputation",
+						Usage:       "bob agent credit-import <agent-id> [--txid <txid> | --proof-type <type> --proof-ref <ref>] --amount <atomic-units>",
 					},
 					{
 						Name:        "credit-imports",
-						Description: "List historical BTC proof imports used for credit",
+						Description: "List historical on-chain proof imports used for credit",
 						Usage:       "bob agent credit-imports <agent-id> [--limit <n>] [--offset <n>]",
+					},
+					{
+						Name:        "x402-import",
+						Description: "Import an x402 settlement receipt to build credit",
+						Usage:       "bob agent x402-import <agent-id> --tx <tx-hash> --network <caip2> --payer <address> --payee <address> --amount <atomic-units>",
 					},
 				},
 			},
-			intentCommandInfo(),
 			{
 				Name:        "score",
-				Description: "BOB Score — agent reputation and trust signals",
+				Description: "BOB Score — operator reputation and trust signals",
 				Children: []CommandInfo{
-					{Name: "me", Description: "View your agent's BOB Score and tier", Usage: "bob score me"},
-					{Name: "composition", Description: "Breakdown of score components", Usage: "bob score composition <agent-id>"},
+					{Name: "me", Description: "View your BOB Score and trust signals", Usage: "bob score me"},
+					{Name: "composition", Description: "Breakdown of score components", Usage: "bob score composition"},
 					{Name: "leaderboard", Description: "Top-ranked agents by BOB Score", Usage: "bob score leaderboard [--limit <n>]"},
-					{Name: "signals", Description: "List trust signals contributing to score", Usage: "bob score signals <agent-id>"},
+					{Name: "signals", Description: "Set public visibility for a trust signal", Usage: "bob score signals --signal <signal-type> --visible <true|false>"},
 				},
 			},
 			{
 				Name:        "binding",
-				Description: "Bind Lightning/EVM node ownership to an agent",
+				Description: "Bind an operator wallet as a BOB Score trust signal",
 				Children: []CommandInfo{
 					{
-						Name:        "lightning-challenge",
-						Description: "Create a Lightning node ownership challenge",
-						Usage:       "bob binding lightning-challenge <agent-id> [--wallet-id <id>]",
+						Name:        "evm-challenge",
+						Description: "Create an EVM wallet ownership challenge",
+						Usage:       "bob binding evm-challenge --address <0x...>",
 						Flags: []FlagInfo{
-							{Name: "wallet-id", Type: "string", Description: "Optional wallet id to bind"},
+							{Name: "address", Type: "string", Required: true, Description: "EVM wallet address (0x...)"},
 						},
 					},
 					{
-						Name:        "lightning-verify",
-						Description: "Verify Lightning node ownership challenge with a node signature",
-						Usage:       "bob binding lightning-verify <agent-id> --challenge-id <id> --signature <sig>",
+						Name:        "evm-verify",
+						Description: "Verify EVM wallet ownership challenge with a wallet signature",
+						Usage:       "bob binding evm-verify --challenge-id <id> --address <0x...> --signature <sig> [--chain-id <0x...>]",
 						Flags: []FlagInfo{
-							{Name: "challenge-id", Type: "string", Required: true, Description: "Ownership challenge id"},
-							{Name: "signature", Type: "string", Required: true, Description: "Node signature over challenge.message"},
+							{Name: "challenge-id", Type: "string", Required: true, Description: "Challenge id from evm-challenge"},
+							{Name: "address", Type: "string", Required: true, Description: "EVM wallet address (0x...)"},
+							{Name: "signature", Type: "string", Required: true, Description: "EIP-191 signature over challenge.message"},
+							{Name: "chain-id", Type: "string", Description: "Optional hex chain id (for example 0x1 or 0x2105)"},
 						},
 					},
 				},
@@ -1322,9 +1327,8 @@ func intentCommandInfo() CommandInfo {
 	}
 }
 
-func addressCommandInfo() CommandInfo { return CommandInfo{} }
+func addressCommandInfo() CommandInfo     { return CommandInfo{} }
 func marketplaceCommandInfo() CommandInfo { return CommandInfo{} }
-
 
 func childCommandInfo(root CommandInfo, name string) CommandInfo {
 	for _, c := range root.Children {
@@ -1337,8 +1341,9 @@ func childCommandInfo(root CommandInfo, name string) CommandInfo {
 
 func main() {
 	root := &cobra.Command{
-		Use:   "bob",
-		Short: "Bank of Bots CLI v" + version,
+		Use:     "bob",
+		Short:   "Bank of Bots CLI v" + version,
+		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			emit(Envelope{
 				OK:      true,
@@ -1350,7 +1355,7 @@ func main() {
 					{Command: "bob agent create --name <name>", Description: "Create a new agent", Params: map[string]Param{
 						"name": {Required: true, Description: "Agent name"},
 					}},
-					{Command: "bob intent quote <agent-id> --amount <n> --currency <BTC|USD|USDC> --destination-type <raw|bank_counterparty|unit_account|bob_address> --destination-ref <ref>", Description: "Quote a payment intent"},
+					{Command: "bob agent credit <agent-id>", Description: "View an agent's BOB Score"},
 					{Command: "bob score me", Description: "View your BOB Score"},
 				},
 			})
@@ -1360,6 +1365,9 @@ func main() {
 		SilenceErrors: true,
 	}
 
+	// Override default --version output to use structured JSON.
+	root.SetVersionTemplate(`{"ok":true,"command":"bob --version","data":{"version":"` + version + `"}}` + "\n")
+
 	// Persistent flag: --api-key. Precedence: flag > BOB_API_KEY env > config file.
 	apiKeyDefault := os.Getenv("BOB_API_KEY")
 	if apiKeyDefault == "" {
@@ -1368,12 +1376,10 @@ func main() {
 	root.PersistentFlags().StringVar(&apiKey, "api-key", apiKeyDefault, "API key for authentication (or set BOB_API_KEY)")
 
 	root.AddCommand(initCmd())
-	root.AddCommand(registerCmd())
 	root.AddCommand(doctorCmd())
 	root.AddCommand(configCmd())
 	root.AddCommand(authCmd())
 	root.AddCommand(agentCmd())
-	root.AddCommand(intentCmd())
 	root.AddCommand(scoreCmd())
 	root.AddCommand(bindingCmd())
 	root.AddCommand(webhookCmd())
@@ -1502,11 +1508,11 @@ func registerAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	var reg struct {
-		AgentID    string   `json:"agent_id"`
-		APIKey     string   `json:"api_key"`
-		OperatorID string   `json:"operator_id"`
-		Status     string   `json:"status"`
-		Message    string   `json:"message"`
+		AgentID     string `json:"agent_id"`
+		APIKey      string `json:"api_key"`
+		OperatorID  string `json:"operator_id"`
+		Status      string `json:"status"`
+		Message     string `json:"message"`
 		NextActions []struct {
 			Command     string `json:"command"`
 			Description string `json:"description"`
@@ -2075,19 +2081,16 @@ func agentCmd() *cobra.Command {
 	// credit-import
 	creditImportCmd := &cobra.Command{
 		Use:   "credit-import [agent-id]",
-		Short: "Import a historical BTC payment proof to build credit reputation",
+		Short: "Import a historical on-chain payment proof to build credit reputation",
 		Args:  cobra.ExactArgs(1),
 		RunE:  agentCreditImport,
 	}
-	creditImportCmd.Flags().String("proof-type", "", "Proof type (btc_onchain_tx, btc_lightning_payment_hash, btc_lightning_preimage)")
-	creditImportCmd.Flags().String("proof-ref", "", "Proof reference value (txid or payment hash)")
-	creditImportCmd.Flags().String("txid", "", "Shortcut for --proof-type btc_onchain_tx")
-	creditImportCmd.Flags().String("payment-hash", "", "Shortcut for --proof-type btc_lightning_payment_hash")
-	creditImportCmd.Flags().String("preimage", "", "Shortcut for --proof-type btc_lightning_preimage")
-	creditImportCmd.Flags().String("invoice", "", "Optional BOLT11 invoice to include in proof metadata")
-	creditImportCmd.Flags().String("rail", "", "Rail (lightning or onchain)")
-	creditImportCmd.Flags().String("currency", "BTC", "Currency (must be BTC)")
-	creditImportCmd.Flags().Int64("amount", 0, "Amount in sats (required)")
+	creditImportCmd.Flags().String("proof-type", "", "Proof type (btc_onchain_tx, eth_onchain_tx, base_onchain_tx, sol_onchain_tx)")
+	creditImportCmd.Flags().String("proof-ref", "", "Proof reference value (txid or transaction hash)")
+	creditImportCmd.Flags().String("txid", "", "Shortcut for --proof-ref when importing an on-chain transaction")
+	creditImportCmd.Flags().String("rail", "onchain", "Rail (must be onchain)")
+	creditImportCmd.Flags().String("currency", "", "Currency (BTC, ETH, or SOL; defaults from proof type)")
+	creditImportCmd.Flags().Int64("amount", 0, "Amount in native atomic units (required)")
 	creditImportCmd.Flags().String("direction", "outbound", "Direction (outbound or inbound)")
 	creditImportCmd.Flags().String("occurred-at", "", "Original payment timestamp (RFC3339)")
 	creditImportCmd.Flags().String("counterparty-ref", "", "Optional counterparty descriptor")
@@ -2097,13 +2100,41 @@ func agentCmd() *cobra.Command {
 	// credit-imports
 	creditImportsCmd := &cobra.Command{
 		Use:   "credit-imports [agent-id]",
-		Short: "List historical BTC proof imports used for credit",
+		Short: "List historical on-chain proof imports used for credit",
 		Args:  cobra.ExactArgs(1),
 		RunE:  agentCreditImports,
 	}
 	creditImportsCmd.Flags().Int("limit", 50, "Max results")
 	creditImportsCmd.Flags().Int("offset", 0, "Results to skip")
 	cmd.AddCommand(creditImportsCmd)
+
+	x402ImportCmd := &cobra.Command{
+		Use:   "x402-import [agent-id]",
+		Short: "Import an x402 payment receipt to build BOB Score credit",
+		Long: `Submit an x402 payment receipt for on-chain verification and credit attribution.
+
+The receipt contains the settlement response from an x402 payment (e.g. paying
+for compute on Together AI or Replicate via the x402 protocol). BOB verifies the
+transaction on the public ledger and awards credit if valid.
+
+Supported networks: Base (eip155:8453), Ethereum (eip155:1), Solana.`,
+		Args: cobra.ExactArgs(1),
+		RunE: agentX402Import,
+	}
+	x402ImportCmd.Flags().String("tx", "", "On-chain transaction hash from x402 settlement (required)")
+	x402ImportCmd.Flags().String("network", "", "CAIP-2 network identifier, e.g. eip155:8453 (required)")
+	x402ImportCmd.Flags().String("payer", "", "Payer wallet address (required)")
+	x402ImportCmd.Flags().String("payee", "", "Payee/service wallet address (required)")
+	x402ImportCmd.Flags().String("amount", "", "Payment amount in atomic units (required)")
+	x402ImportCmd.Flags().String("asset", "", "Token contract address, e.g. USDC on Base")
+	x402ImportCmd.Flags().String("resource-url", "", "The service URL that was paid for")
+	x402ImportCmd.Flags().String("scheme", "exact", "x402 payment scheme")
+	x402ImportCmd.MarkFlagRequired("tx")
+	x402ImportCmd.MarkFlagRequired("network")
+	x402ImportCmd.MarkFlagRequired("payer")
+	x402ImportCmd.MarkFlagRequired("payee")
+	x402ImportCmd.MarkFlagRequired("amount")
+	cmd.AddCommand(x402ImportCmd)
 
 	return cmd
 }
@@ -2129,7 +2160,6 @@ func agentCredit(cmd *cobra.Command, args []string) error {
 	})
 	return nil
 }
-
 
 func agentCreditEvents(cmd *cobra.Command, args []string) error {
 	agentID := args[0]
@@ -2158,9 +2188,6 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	proofType, _ := cmd.Flags().GetString("proof-type")
 	proofRef, _ := cmd.Flags().GetString("proof-ref")
 	txid, _ := cmd.Flags().GetString("txid")
-	paymentHash, _ := cmd.Flags().GetString("payment-hash")
-	preimage, _ := cmd.Flags().GetString("preimage")
-	invoice, _ := cmd.Flags().GetString("invoice")
 	rail, _ := cmd.Flags().GetString("rail")
 	currency, _ := cmd.Flags().GetString("currency")
 	amount, _ := cmd.Flags().GetInt64("amount")
@@ -2171,74 +2198,44 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	proofType = strings.ToLower(strings.TrimSpace(proofType))
 	proofRef = strings.TrimSpace(proofRef)
 	txid = strings.ToLower(strings.TrimSpace(txid))
-	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
-	preimage = strings.TrimSpace(preimage)
-	invoice = strings.TrimSpace(invoice)
 
-	shortcuts := 0
-	if txid != "" {
-		shortcuts++
-	}
-	if paymentHash != "" {
-		shortcuts++
-	}
-	if preimage != "" {
-		shortcuts++
-	}
-	if shortcuts > 1 {
-		emitError("bob agent credit-import", fmt.Errorf("set one shortcut: --txid, --payment-hash, or --preimage"))
-		return nil
-	}
 	if txid != "" {
 		if proofType != "" || proofRef != "" {
 			emitError("bob agent credit-import", fmt.Errorf("use either shortcut flags or --proof-type/--proof-ref"))
 			return nil
 		}
-		proofType = "btc_onchain_tx"
 		proofRef = txid
 	}
-	if paymentHash != "" {
-		if proofType != "" || proofRef != "" {
-			emitError("bob agent credit-import", fmt.Errorf("use either shortcut flags or --proof-type/--proof-ref"))
-			return nil
-		}
-		proofType = "btc_lightning_payment_hash"
-		proofRef = paymentHash
-	}
-	if preimage != "" {
-		if proofType != "" || proofRef != "" {
-			emitError("bob agent credit-import", fmt.Errorf("use either shortcut flags or --proof-type/--proof-ref"))
-			return nil
-		}
-		proofType = "btc_lightning_preimage"
-		// proof_ref is the payment hash; user must also pass --proof-ref
-	}
-	if proofType == "" || (proofRef == "" && proofType != "btc_lightning_preimage") {
-		emitError("bob agent credit-import", fmt.Errorf("proof is required: use --txid, --payment-hash, --preimage, or --proof-type + --proof-ref"))
+	if proofType == "" || proofRef == "" {
+		emitError("bob agent credit-import", fmt.Errorf("proof is required: use --txid or --proof-type + --proof-ref"))
 		return nil
 	}
-	if proofType != "btc_onchain_tx" && proofType != "btc_lightning_payment_hash" && proofType != "btc_lightning_preimage" {
-		emitError("bob agent credit-import", fmt.Errorf("proof-type must be btc_onchain_tx, btc_lightning_payment_hash, or btc_lightning_preimage"))
+	defaultCurrency := ""
+	switch proofType {
+	case "btc_onchain_tx":
+		defaultCurrency = "BTC"
+	case "eth_onchain_tx", "base_onchain_tx":
+		defaultCurrency = "ETH"
+	case "sol_onchain_tx":
+		defaultCurrency = "SOL"
+	default:
+		emitError("bob agent credit-import", fmt.Errorf("proof-type must be btc_onchain_tx, eth_onchain_tx, base_onchain_tx, or sol_onchain_tx"))
 		return nil
 	}
 	rail = strings.ToLower(strings.TrimSpace(rail))
 	if rail == "" {
-		if proofType == "btc_onchain_tx" {
-			rail = "onchain"
-		} else {
-			rail = "lightning"
-		}
+		rail = "onchain"
 	}
-	if rail != "onchain" && rail != "lightning" {
-		emitError("bob agent credit-import", fmt.Errorf("rail must be lightning or onchain"))
+	if rail != "onchain" {
+		emitError("bob agent credit-import", fmt.Errorf("rail must be onchain"))
 		return nil
 	}
 	currency = strings.ToUpper(strings.TrimSpace(currency))
 	if currency == "" {
-		currency = "BTC"
+		currency = defaultCurrency
 	}
-	if currency != "BTC" {
-		emitError("bob agent credit-import", fmt.Errorf("currency must be BTC"))
+	if currency != defaultCurrency {
+		emitError("bob agent credit-import", fmt.Errorf("currency must be %s for %s", defaultCurrency, proofType))
 		return nil
 	}
 	if amount <= 0 {
@@ -2272,16 +2269,6 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	if strings.TrimSpace(counterpartyRef) != "" {
 		payload["counterparty_ref"] = strings.TrimSpace(counterpartyRef)
 	}
-	if preimage != "" || invoice != "" {
-		meta := map[string]any{}
-		if preimage != "" {
-			meta["preimage"] = preimage
-		}
-		if invoice != "" {
-			meta["invoice"] = invoice
-		}
-		payload["metadata"] = meta
-	}
 
 	data, err := apiPost("/agents/"+url.PathEscape(agentID)+"/credit/imports/payment-proofs", payload)
 	if err != nil {
@@ -2307,13 +2294,13 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 		switch creditReason {
 		case "self_counterparty_blocked":
 			nextActions = append(nextActions, NextAction{
-				Command:     fmt.Sprintf("bob agent credit-import %s --proof-type <type> --proof-ref <ref> --rail <onchain|lightning> --currency BTC --amount <sats> --direction outbound --counterparty-ref <external-counterparty>", agentID),
+				Command:     fmt.Sprintf("bob agent credit-import %s --proof-type <type> --proof-ref <ref> --rail onchain --currency <%s> --amount <atomic-units> --direction outbound --counterparty-ref <external-counterparty>", agentID, defaultCurrency),
 				Description: "Re-import using a non-self counterparty reference",
 			})
 		case "amount_below_credit_floor":
 			nextActions = append(nextActions, NextAction{
-				Command:     fmt.Sprintf("bob agent credit-import %s --proof-type <type> --proof-ref <ref> --rail <onchain|lightning> --currency BTC --amount <at-least-1000-sats>", agentID),
-				Description: "Re-import with an amount above the BTC credit floor",
+				Command:     fmt.Sprintf("bob agent credit-import %s --proof-type <type> --proof-ref <ref> --rail onchain --currency <%s> --amount <higher-amount>", agentID, defaultCurrency),
+				Description: "Re-import with an amount above the credit floor for that rail",
 			})
 		}
 	}
@@ -2348,6 +2335,109 @@ func agentCreditImports(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func agentX402Import(cmd *cobra.Command, args []string) error {
+	agentID := args[0]
+	tx, _ := cmd.Flags().GetString("tx")
+	network, _ := cmd.Flags().GetString("network")
+	payer, _ := cmd.Flags().GetString("payer")
+	payee, _ := cmd.Flags().GetString("payee")
+	amount, _ := cmd.Flags().GetString("amount")
+	asset, _ := cmd.Flags().GetString("asset")
+	resourceURL, _ := cmd.Flags().GetString("resource-url")
+	scheme, _ := cmd.Flags().GetString("scheme")
+
+	tx = strings.TrimSpace(tx)
+	if tx == "" {
+		emitError("bob agent x402-import", fmt.Errorf("--tx is required (on-chain transaction hash)"))
+		return nil
+	}
+	network = strings.TrimSpace(network)
+	if network == "" {
+		emitError("bob agent x402-import", fmt.Errorf("--network is required (CAIP-2 format, e.g. eip155:8453)"))
+		return nil
+	}
+	payer = strings.TrimSpace(payer)
+	if payer == "" {
+		emitError("bob agent x402-import", fmt.Errorf("--payer is required (payer wallet address)"))
+		return nil
+	}
+	payee = strings.TrimSpace(payee)
+	if payee == "" {
+		emitError("bob agent x402-import", fmt.Errorf("--payee is required (payee/service wallet address)"))
+		return nil
+	}
+	amount = strings.TrimSpace(amount)
+	if amount == "" {
+		emitError("bob agent x402-import", fmt.Errorf("--amount is required (atomic units)"))
+		return nil
+	}
+
+	payload := map[string]any{
+		"resource_url": resourceURL,
+		"requirements": map[string]any{
+			"scheme":            scheme,
+			"network":           network,
+			"amount":            amount,
+			"asset":             asset,
+			"payTo":             payee,
+			"maxTimeoutSeconds": 60,
+		},
+		"authorization": map[string]any{
+			"from":  payer,
+			"to":    payee,
+			"value": amount,
+		},
+		"settlement": map[string]any{
+			"success":     true,
+			"transaction": tx,
+			"network":     network,
+			"payer":       payer,
+		},
+	}
+
+	data, err := apiPost("/agents/"+url.PathEscape(agentID)+"/credit/imports/x402-receipts", payload)
+	if err != nil {
+		emitErrorWithActions("bob agent x402-import", err, []NextAction{
+			{Command: fmt.Sprintf("bob agent credit-imports %s", agentID), Description: "List imported proofs"},
+			{Command: fmt.Sprintf("bob agent credit-events %s", agentID), Description: "Inspect credit event timeline"},
+		})
+		return nil
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("failed to parse x402 import response: %w", err)
+	}
+
+	creditData, _ := resp["credit"].(map[string]any)
+	creditAwarded, _ := creditData["awarded"].(bool)
+	creditReason, _ := creditData["reason"].(string)
+	nextActions := []NextAction{
+		{Command: fmt.Sprintf("bob agent credit-imports %s", agentID), Description: "List imported proofs"},
+		{Command: fmt.Sprintf("bob agent credit-events %s", agentID), Description: "Check if credit increased"},
+		{Command: fmt.Sprintf("bob agent credit %s", agentID), Description: "View updated score/tier"},
+	}
+	if !creditAwarded && creditReason != "" {
+		switch creditReason {
+		case "amount_below_credit_floor":
+			nextActions = append(nextActions, NextAction{
+				Command:     fmt.Sprintf("bob agent x402-import %s --tx <hash> --network %s --payer %s --payee %s --amount <higher-amount>", agentID, network, payer, payee),
+				Description: "Re-import with an amount above the USDC credit floor ($0.10)",
+			})
+		case "credit_cap_reached":
+			nextActions = append(nextActions, NextAction{
+				Command:     fmt.Sprintf("bob agent credit %s", agentID),
+				Description: "Credit cap reached for this rail — check overall score",
+			})
+		}
+	}
+	emit(Envelope{
+		OK:          true,
+		Command:     "bob agent x402-import",
+		Data:        resp,
+		NextActions: nextActions,
+	})
+	return nil
+}
 
 func agentWebhookCreate(cmd *cobra.Command, args []string) error {
 	agentID := args[0]
@@ -2657,7 +2747,6 @@ func agentApprove(cmd *cobra.Command, args []string) error {
 	})
 	return nil
 }
-
 
 // --- Intent commands ---
 
@@ -3359,7 +3448,6 @@ func intentList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-
 // --- config commands ---
 
 func configCmd() *cobra.Command {
@@ -3460,7 +3548,7 @@ func configSet(cmd *cobra.Command, args []string) error {
 func scoreCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "score",
-		Short: "BOB Score — agent reputation and trust signals",
+		Short: "BOB Score — operator reputation and trust signals",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			emit(Envelope{
 				OK:      true,
@@ -3475,22 +3563,9 @@ func scoreCmd() *cobra.Command {
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "me",
-		Short: "View your agent's BOB Score and tier",
+		Short: "View your BOB Score and trust signals",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			data, err := apiGet("/auth/me")
-			if err != nil {
-				emitError("bob score me", err)
-				return nil
-			}
-			var identity map[string]any
-			json.Unmarshal(data, &identity)
-			agentData, _ := identity["agent"].(map[string]any)
-			agentID, _ := agentData["id"].(string)
-			if agentID == "" {
-				emitError("bob score me", fmt.Errorf("no agent identity found — authenticate with an agent API key"))
-				return nil
-			}
-			scoreData, err := apiGet("/agents/" + url.PathEscape(agentID) + "/credit")
+			scoreData, err := apiGet("/score/me")
 			if err != nil {
 				emitError("bob score me", err)
 				return nil
@@ -3502,20 +3577,19 @@ func scoreCmd() *cobra.Command {
 				Command: "bob score me",
 				Data:    resp,
 				NextActions: []NextAction{
-					{Command: "bob score composition " + agentID, Description: "View score component breakdown"},
-					{Command: "bob agent credit-events " + agentID, Description: "View credit event history"},
+					{Command: "bob score composition", Description: "View score component breakdown"},
+					{Command: "bob score leaderboard", Description: "Compare against the public leaderboard"},
 				},
 			})
 			return nil
 		},
 	})
 	compositionCmd := &cobra.Command{
-		Use:   "composition [agent-id]",
+		Use:   "composition",
 		Short: "Breakdown of score components",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agentID := args[0]
-			data, err := apiGet("/agents/" + url.PathEscape(agentID) + "/credit")
+			data, err := apiGet("/score/me/composition")
 			if err != nil {
 				emitError("bob score composition", err)
 				return nil
@@ -3546,12 +3620,16 @@ func scoreCmd() *cobra.Command {
 	leaderboardCmd.Flags().Int("limit", 20, "Max results")
 	cmd.AddCommand(leaderboardCmd)
 	signalsCmd := &cobra.Command{
-		Use:   "signals [agent-id]",
-		Short: "List trust signals contributing to score",
-		Args:  cobra.ExactArgs(1),
+		Use:   "signals",
+		Short: "Set public visibility for a trust signal",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agentID := args[0]
-			data, err := apiGet("/agents/" + url.PathEscape(agentID) + "/score/signals")
+			signal, _ := cmd.Flags().GetString("signal")
+			visible, _ := cmd.Flags().GetBool("visible")
+			data, err := apiPatch("/score/me/signals/visibility", map[string]any{
+				"signal_type": strings.TrimSpace(signal),
+				"is_public":   visible,
+			})
 			if err != nil {
 				emitError("bob score signals", err)
 				return nil
@@ -3562,6 +3640,10 @@ func scoreCmd() *cobra.Command {
 			return nil
 		},
 	}
+	signalsCmd.Flags().String("signal", "", "Signal type to update (required)")
+	signalsCmd.Flags().Bool("visible", false, "Whether the signal should be publicly visible")
+	signalsCmd.MarkFlagRequired("signal")
+	signalsCmd.MarkFlagRequired("visible")
 	cmd.AddCommand(signalsCmd)
 	return cmd
 }
@@ -3571,38 +3653,19 @@ func scoreCmd() *cobra.Command {
 func bindingCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "binding",
-		Short: "Bind Lightning/EVM node ownership to an agent",
+		Short: "Bind an operator wallet as a BOB Score trust signal",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			emit(Envelope{
 				OK:      true,
 				Command: "bob binding",
 				Data:    childCommandInfo(commandTree(), "binding"),
 				NextActions: []NextAction{
-					{Command: "bob binding lightning-challenge <agent-id>", Description: "Create a Lightning node ownership challenge"},
+					{Command: "bob binding evm-challenge --address <0x...>", Description: "Create an EVM wallet ownership challenge"},
 				},
 			})
 			return nil
 		},
 	}
-
-	challengeCmd := &cobra.Command{
-		Use:   "lightning-challenge [agent-id]",
-		Short: "Create a Lightning node ownership challenge",
-		Args:  cobra.ExactArgs(1),
-		RunE:  intentNodeBindChallenge,
-	}
-	challengeCmd.Flags().String("wallet-id", "", "Optional wallet id to bind")
-	cmd.AddCommand(challengeCmd)
-
-	verifyCmd := &cobra.Command{
-		Use:   "lightning-verify [agent-id]",
-		Short: "Verify Lightning node ownership challenge with a node signature",
-		Args:  cobra.ExactArgs(1),
-		RunE:  intentNodeBindVerify,
-	}
-	verifyCmd.Flags().String("challenge-id", "", "Ownership challenge id (required)")
-	verifyCmd.Flags().String("signature", "", "Node signature over challenge.message (required)")
-	cmd.AddCommand(verifyCmd)
 
 	evmChallengeCmd := &cobra.Command{
 		Use:   "evm-challenge",
