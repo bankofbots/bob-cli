@@ -1125,8 +1125,8 @@ func commandTree() CommandInfo {
 					},
 					{
 						Name:        "credit",
-						Description: "Show agent credit score, tier, and effective policy limits",
-						Usage:       "bob agent credit <agent-id>",
+						Description: "[REMOVED] Use 'bob score me' instead",
+						Usage:       "bob score me",
 					},
 					{
 						Name:        "credit-events",
@@ -1355,7 +1355,7 @@ func main() {
 					{Command: "bob agent create --name <name>", Description: "Create a new agent", Params: map[string]Param{
 						"name": {Required: true, Description: "Agent name"},
 					}},
-					{Command: "bob agent credit <agent-id>", Description: "View an agent's BOB Score"},
+					{Command: "bob score me", Description: "View your BOB Score"},
 					{Command: "bob score me", Description: "View your BOB Score"},
 				},
 			})
@@ -1971,7 +1971,7 @@ func authMe(cmd *cobra.Command, args []string) error {
 				{Command: fmt.Sprintf("bob agent get %s", agentID), Description: "View your agent details"},
 				{Command: "bob score me", Description: "View your BOB Score and tier"},
 				{Command: fmt.Sprintf("bob intent list %s", agentID), Description: "View payment intents"},
-				{Command: fmt.Sprintf("bob agent credit %s", agentID), Description: "View credit score and tier"},
+				{Command: "bob score me", Description: "View credit score and tier"},
 			}
 		} else {
 			nextActions = []NextAction{
@@ -2060,12 +2060,13 @@ func agentCmd() *cobra.Command {
 	approveCmd.Flags().String("seed-wallet-id", "", "Explicit seed wallet override")
 	cmd.AddCommand(approveCmd)
 
-	// credit
+	// credit (deprecated — use "bob score me")
 	cmd.AddCommand(&cobra.Command{
-		Use:   "credit [agent-id]",
-		Short: "Show agent credit score, tier, and effective policy limits",
-		Args:  cobra.ExactArgs(1),
-		RunE:  agentCredit,
+		Use:        "credit [agent-id]",
+		Short:      "[REMOVED] Use 'bob score me' instead",
+		Args:       cobra.ExactArgs(1),
+		Deprecated: "use 'bob score me' instead",
+		RunE:       agentCredit,
 	})
 
 	// credit-events
@@ -2144,24 +2145,12 @@ Supported networks: Base (eip155:8453), Ethereum (eip155:1), Solana.`,
 }
 
 func agentCredit(cmd *cobra.Command, args []string) error {
-	agentID := args[0]
-	data, err := apiGet("/agents/" + url.PathEscape(agentID) + "/credit")
-	if err != nil {
-		emitError("bob agent credit", err)
-		return nil
-	}
-	var resp map[string]any
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return fmt.Errorf("failed to parse credit response: %w", err)
-	}
-	emit(Envelope{
-		OK:      true,
-		Command: "bob agent credit",
-		Data:    resp,
-		NextActions: []NextAction{
-			{Command: fmt.Sprintf("bob agent credit-events %s", agentID), Description: "View credit event history"},
+	emitErrorWithActions("bob agent credit",
+		fmt.Errorf("'bob agent credit' has been removed — use 'bob score me' instead"),
+		[]NextAction{
+			{Command: "bob score me", Description: "View your BOB Score (replacement command)"},
 		},
-	})
+	)
 	return nil
 }
 
@@ -2300,7 +2289,7 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	nextActions := []NextAction{
 		{Command: fmt.Sprintf("bob agent credit-imports %s", agentID), Description: "List imported proofs"},
 		{Command: fmt.Sprintf("bob agent credit-events %s", agentID), Description: "Check if credit increased"},
-		{Command: fmt.Sprintf("bob agent credit %s", agentID), Description: "View updated score/tier"},
+		{Command: "bob score me", Description: "View updated score/tier"},
 	}
 	if !creditAwarded {
 		switch creditReason {
@@ -2437,7 +2426,7 @@ func agentX402Import(cmd *cobra.Command, args []string) error {
 	nextActions := []NextAction{
 		{Command: fmt.Sprintf("bob agent credit-imports %s", agentID), Description: "List imported proofs"},
 		{Command: fmt.Sprintf("bob agent credit-events %s", agentID), Description: "Check if credit increased"},
-		{Command: fmt.Sprintf("bob agent credit %s", agentID), Description: "View updated score/tier"},
+		{Command: "bob score me", Description: "View updated score/tier"},
 	}
 	if !creditAwarded && creditReason != "" {
 		switch creditReason {
@@ -2448,7 +2437,7 @@ func agentX402Import(cmd *cobra.Command, args []string) error {
 			})
 		case "credit_cap_reached":
 			nextActions = append(nextActions, NextAction{
-				Command:     fmt.Sprintf("bob agent credit %s", agentID),
+				Command:     "bob score me",
 				Description: "Credit cap reached for this rail — check overall score",
 			})
 		}
@@ -2619,7 +2608,7 @@ func agentConnect(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n  *** Save this API key now — it will not be shown again ***\n  %s\n\n", agentAPIKey)
 		nextActions = append([]NextAction{
 			{Command: fmt.Sprintf("export BOB_API_KEY=%s", redactKey(agentAPIKey)), Description: "Set API key in your environment (redacted — use full key from above)"},
-			{Command: fmt.Sprintf("bob agent credit %s", agentID), Description: "Check credit score and tier"},
+			{Command: "bob score me", Description: "Check credit score and tier"},
 		}, nextActions...)
 	} else if apiKeyPending {
 		nextActions = append([]NextAction{
@@ -2710,7 +2699,7 @@ func agentGet(cmd *cobra.Command, args []string) error {
 		Command: "bob agent get",
 		Data:    json.RawMessage(data),
 		NextActions: []NextAction{
-			{Command: fmt.Sprintf("bob agent credit %s", id), Description: "View credit score and tier"},
+			{Command: "bob score me", Description: "View credit score and tier"},
 			{Command: fmt.Sprintf("bob intent list %s", id), Description: "View payment intents"},
 			{Command: "bob score me", Description: "View BOB Score"},
 			{Command: fmt.Sprintf("bob webhook list %s", id), Description: "View webhook subscribers"},
@@ -2749,7 +2738,7 @@ func agentApprove(cmd *cobra.Command, args []string) error {
 
 	nextActions := []NextAction{
 		{Command: fmt.Sprintf("bob agent get %s", agentID), Description: "View updated agent status"},
-		{Command: fmt.Sprintf("bob agent credit %s", agentID), Description: "View credit score and tier"},
+		{Command: "bob score me", Description: "View credit score and tier"},
 	}
 	if agentAPIKey != "" {
 		fmt.Fprintf(os.Stderr, "\n  *** Save this API key now — it will not be shown again ***\n  %s\n\n", agentAPIKey)
