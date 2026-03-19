@@ -17,7 +17,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.6.1"
+const version = "0.7.0"
 
 const defaultAPIBase = "http://localhost:8080/api/v1"
 
@@ -1385,6 +1385,7 @@ func main() {
 	root.AddCommand(webhookCmd())
 	root.AddCommand(inboxCmd())
 	root.AddCommand(apiKeyCmd())
+	root.AddCommand(registerCmd())
 
 	if err := root.Execute(); err != nil {
 		emitError("bob", err)
@@ -2094,6 +2095,8 @@ func agentCmd() *cobra.Command {
 	creditImportCmd.Flags().String("direction", "outbound", "Direction (outbound or inbound)")
 	creditImportCmd.Flags().String("occurred-at", "", "Original payment timestamp (RFC3339)")
 	creditImportCmd.Flags().String("counterparty-ref", "", "Optional counterparty descriptor")
+	creditImportCmd.Flags().String("sender-address", "", "Sender wallet address (required for outbound EVM proofs, must be a bound wallet)")
+	creditImportCmd.Flags().String("recipient-address", "", "Recipient wallet address (required for inbound EVM proofs, must be a bound wallet)")
 	creditImportCmd.MarkFlagRequired("amount")
 	cmd.AddCommand(creditImportCmd)
 
@@ -2129,6 +2132,7 @@ Supported networks: Base (eip155:8453), Ethereum (eip155:1), Solana.`,
 	x402ImportCmd.Flags().String("asset", "", "Token contract address, e.g. USDC on Base")
 	x402ImportCmd.Flags().String("resource-url", "", "The service URL that was paid for")
 	x402ImportCmd.Flags().String("scheme", "exact", "x402 payment scheme")
+	x402ImportCmd.Flags().String("direction", "outbound", "Direction: outbound (you paid) or inbound (you received payment)")
 	x402ImportCmd.MarkFlagRequired("tx")
 	x402ImportCmd.MarkFlagRequired("network")
 	x402ImportCmd.MarkFlagRequired("payer")
@@ -2194,6 +2198,8 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	direction, _ := cmd.Flags().GetString("direction")
 	occurredAt, _ := cmd.Flags().GetString("occurred-at")
 	counterpartyRef, _ := cmd.Flags().GetString("counterparty-ref")
+	senderAddress, _ := cmd.Flags().GetString("sender-address")
+	recipientAddress, _ := cmd.Flags().GetString("recipient-address")
 
 	proofType = strings.ToLower(strings.TrimSpace(proofType))
 	proofRef = strings.TrimSpace(proofRef)
@@ -2268,6 +2274,12 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	}
 	if strings.TrimSpace(counterpartyRef) != "" {
 		payload["counterparty_ref"] = strings.TrimSpace(counterpartyRef)
+	}
+	if strings.TrimSpace(senderAddress) != "" {
+		payload["sender_address"] = strings.TrimSpace(senderAddress)
+	}
+	if strings.TrimSpace(recipientAddress) != "" {
+		payload["recipient_address"] = strings.TrimSpace(recipientAddress)
 	}
 
 	data, err := apiPost("/agents/"+url.PathEscape(agentID)+"/credit/imports/payment-proofs", payload)
@@ -2345,6 +2357,7 @@ func agentX402Import(cmd *cobra.Command, args []string) error {
 	asset, _ := cmd.Flags().GetString("asset")
 	resourceURL, _ := cmd.Flags().GetString("resource-url")
 	scheme, _ := cmd.Flags().GetString("scheme")
+	x402Direction, _ := cmd.Flags().GetString("direction")
 
 	tx = strings.TrimSpace(tx)
 	if tx == "" {
@@ -2372,8 +2385,18 @@ func agentX402Import(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	x402Direction = strings.ToLower(strings.TrimSpace(x402Direction))
+	if x402Direction == "" {
+		x402Direction = "outbound"
+	}
+	if x402Direction != "outbound" && x402Direction != "inbound" {
+		emitError("bob agent x402-import", fmt.Errorf("direction must be outbound or inbound"))
+		return nil
+	}
+
 	payload := map[string]any{
 		"resource_url": resourceURL,
+		"direction":    x402Direction,
 		"requirements": map[string]any{
 			"scheme":            scheme,
 			"network":           network,
