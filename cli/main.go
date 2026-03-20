@@ -2141,6 +2141,41 @@ Supported networks: Base (eip155:8453), Ethereum (eip155:1), Solana.`,
 	x402ImportCmd.MarkFlagRequired("amount")
 	cmd.AddCommand(x402ImportCmd)
 
+	mppImportCmd := &cobra.Command{
+		Use:   "mpp-import [agent-id]",
+		Short: "Import an MPP (Machine Payments Protocol) receipt",
+		Long: `Submit an MPP payment receipt for BOB Score credit attribution.
+
+MPP is a payment-method-agnostic protocol for HTTP 402 payments.
+Supported methods: tempo (stablecoin), lightning, stripe, card.
+
+Example:
+  bob agent mpp-import $BOB_AGENT_ID \
+    --method tempo \
+    --reference 0xabc123... \
+    --challenge-id ch_xxx \
+    --challenge-intent pay \
+    --challenge-request <base64url-encoded-json>`,
+		Args: cobra.ExactArgs(1),
+		RunE: agentMPPImport,
+	}
+	mppImportCmd.Flags().String("method", "", "Payment method: tempo, lightning, stripe, card (required)")
+	mppImportCmd.Flags().String("reference", "", "Transaction hash or payment reference (required)")
+	mppImportCmd.Flags().String("challenge-id", "", "MPP challenge ID (required)")
+	mppImportCmd.Flags().String("challenge-method", "", "Challenge payment method (defaults to --method)")
+	mppImportCmd.Flags().String("challenge-intent", "", "Challenge intent (required)")
+	mppImportCmd.Flags().String("challenge-request", "", "Base64url-encoded challenge request JSON (required)")
+	mppImportCmd.Flags().String("realm", "", "Server realm from challenge")
+	mppImportCmd.Flags().String("source", "", "Payer identifier (DID or wallet address)")
+	mppImportCmd.Flags().String("resource-url", "", "The service URL that was paid for")
+	mppImportCmd.Flags().String("direction", "outbound", "Direction: outbound (you paid) or inbound (you received)")
+	mppImportCmd.MarkFlagRequired("method")
+	mppImportCmd.MarkFlagRequired("reference")
+	mppImportCmd.MarkFlagRequired("challenge-id")
+	mppImportCmd.MarkFlagRequired("challenge-intent")
+	mppImportCmd.MarkFlagRequired("challenge-request")
+	cmd.AddCommand(mppImportCmd)
+
 	return cmd
 }
 
@@ -2151,6 +2186,66 @@ func agentCredit(cmd *cobra.Command, args []string) error {
 			{Command: "bob score me", Description: "View your BOB Score (replacement command)"},
 		},
 	)
+	return nil
+}
+
+func agentMPPImport(cmd *cobra.Command, args []string) error {
+	agentID := args[0]
+	method, _ := cmd.Flags().GetString("method")
+	reference, _ := cmd.Flags().GetString("reference")
+	challengeID, _ := cmd.Flags().GetString("challenge-id")
+	challengeMethod, _ := cmd.Flags().GetString("challenge-method")
+	challengeIntent, _ := cmd.Flags().GetString("challenge-intent")
+	challengeRequest, _ := cmd.Flags().GetString("challenge-request")
+	realm, _ := cmd.Flags().GetString("realm")
+	source, _ := cmd.Flags().GetString("source")
+	resourceURL, _ := cmd.Flags().GetString("resource-url")
+	direction, _ := cmd.Flags().GetString("direction")
+
+	if challengeMethod == "" {
+		challengeMethod = method
+	}
+
+	payload := map[string]any{
+		"receipt": map[string]any{
+			"status":    "success",
+			"method":    method,
+			"reference": reference,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"credential": map[string]any{
+			"challenge": map[string]any{
+				"id":      challengeID,
+				"method":  challengeMethod,
+				"intent":  challengeIntent,
+				"request": challengeRequest,
+				"realm":   realm,
+			},
+			"source": source,
+		},
+		"resource_url": resourceURL,
+		"direction":    direction,
+	}
+
+	path := fmt.Sprintf("/agents/%s/credit/imports/mpp-receipts", url.PathEscape(agentID))
+	data, err := apiPost(path, payload)
+	if err != nil {
+		emitError("bob agent mpp-import", err)
+		return nil
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("failed to parse MPP import response: %w", err)
+	}
+	emit(Envelope{
+		OK:      true,
+		Command: "bob agent mpp-import",
+		Data:    resp,
+		NextActions: []NextAction{
+			{Command: fmt.Sprintf("bob agent credit-events %s", agentID), Description: "View credit history"},
+			{Command: "bob score me", Description: "Check updated BOB Score"},
+		},
+	})
 	return nil
 }
 
