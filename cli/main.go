@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1775,6 +1779,20 @@ func initSession(cmd *cobra.Command, args []string) error {
 		}, nextActions...)
 	}
 
+	// Auto-bind auth key and issue passport (best-effort, non-blocking).
+	// Generates an Ed25519 keypair, binds it via challenge/verify, then issues
+	// a W3C Verifiable Credential passport. If any step fails, init still succeeds.
+	savedBase := apiBase
+	savedKey := apiKey
+	apiBase = normalizedAPIBase
+	apiKey = initAPIKey
+	passportResult := autoBindAndIssuePassport(agentID)
+	apiBase = savedBase
+	apiKey = savedKey
+	if passportResult != "" {
+		warnings = append(warnings, passportResult)
+	}
+
 	emit(Envelope{
 		OK:      true,
 		Command: "bob init",
@@ -2175,6 +2193,139 @@ Example:
 	mppImportCmd.MarkFlagRequired("challenge-intent")
 	mppImportCmd.MarkFlagRequired("challenge-request")
 	cmd.AddCommand(mppImportCmd)
+
+	// --- Passport: auth key binding ---
+
+	authKeyChallengeCmd := &cobra.Command{
+		Use:   "auth-key-challenge [agent-id]",
+		Short: "Create an auth key binding challenge (for passport issuance)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			agentID := args[0]
+			alg, _ := cmd.Flags().GetString("alg")
+			data, err := apiPost(fmt.Sprintf("/agents/%s/auth-key/challenge", url.PathEscape(agentID)), map[string]any{"alg": alg})
+			if err != nil {
+				emitError("bob agent auth-key-challenge", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob agent auth-key-challenge",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: fmt.Sprintf("bob agent auth-key-verify %s --challenge-id <id> --kid <kid> --public-key <base64url> --signature <base64url>", agentID), Description: "Submit signed challenge"},
+				},
+			})
+			return nil
+		},
+	}
+	authKeyChallengeCmd.Flags().String("alg", "Ed25519", "Key algorithm")
+	cmd.AddCommand(authKeyChallengeCmd)
+
+	authKeyVerifyCmd := &cobra.Command{
+		Use:   "auth-key-verify [agent-id]",
+		Short: "Verify auth key binding with signed challenge",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			agentID := args[0]
+			challengeID, _ := cmd.Flags().GetString("challenge-id")
+			kid, _ := cmd.Flags().GetString("kid")
+			alg, _ := cmd.Flags().GetString("alg")
+			publicKey, _ := cmd.Flags().GetString("public-key")
+			signature, _ := cmd.Flags().GetString("signature")
+			data, err := apiPost(fmt.Sprintf("/agents/%s/auth-key/verify", url.PathEscape(agentID)), map[string]any{
+				"challenge_id": challengeID,
+				"key": map[string]any{
+					"kid": kid,
+					"alg": alg,
+					"public_key_jwk": map[string]any{
+						"kty": "OKP",
+						"crv": "Ed25519",
+						"x":   publicKey,
+					},
+				},
+				"signature": signature,
+			})
+			if err != nil {
+				emitError("bob agent auth-key-verify", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob agent auth-key-verify",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: fmt.Sprintf("bob agent passport-issue %s", agentID), Description: "Issue a W3C Verifiable Credential passport"},
+				},
+			})
+			return nil
+		},
+	}
+	authKeyVerifyCmd.Flags().String("challenge-id", "", "Challenge ID from auth-key-challenge (required)")
+	authKeyVerifyCmd.Flags().String("kid", "", "Key ID (required)")
+	authKeyVerifyCmd.Flags().String("alg", "Ed25519", "Key algorithm")
+	authKeyVerifyCmd.Flags().String("public-key", "", "Base64url-encoded Ed25519 public key (required)")
+	authKeyVerifyCmd.Flags().String("signature", "", "Base64url-encoded signature (required)")
+	authKeyVerifyCmd.MarkFlagRequired("challenge-id")
+	authKeyVerifyCmd.MarkFlagRequired("kid")
+	authKeyVerifyCmd.MarkFlagRequired("public-key")
+	authKeyVerifyCmd.MarkFlagRequired("signature")
+	cmd.AddCommand(authKeyVerifyCmd)
+
+	// --- Passport: issue and get ---
+
+	passportIssueCmd := &cobra.Command{
+		Use:   "passport-issue [agent-id]",
+		Short: "Issue a W3C Verifiable Credential passport",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			agentID := args[0]
+			data, err := apiPost(fmt.Sprintf("/agents/%s/credential", url.PathEscape(agentID)), map[string]any{})
+			if err != nil {
+				emitError("bob agent passport-issue", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob agent passport-issue",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: fmt.Sprintf("bob agent passport-get %s", agentID), Description: "View your passport"},
+				},
+			})
+			return nil
+		},
+	}
+	cmd.AddCommand(passportIssueCmd)
+
+	passportGetCmd := &cobra.Command{
+		Use:   "passport-get [agent-id]",
+		Short: "Get agent's latest active passport",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			agentID := args[0]
+			data, err := apiGet(fmt.Sprintf("/agents/%s/credential", url.PathEscape(agentID)))
+			if err != nil {
+				emitError("bob agent passport-get", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob agent passport-get",
+				Data:    resp,
+			})
+			return nil
+		},
+	}
+	cmd.AddCommand(passportGetCmd)
 
 	return cmd
 }
@@ -4181,4 +4332,77 @@ func operatorAPIKeyRevoke(cmd *cobra.Command, args []string) error {
 		},
 	})
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Auto-passport: generate Ed25519 key, bind, issue passport during init
+// ---------------------------------------------------------------------------
+
+const authKeyBindDomainPrefix = "BOB Passport Auth v1\n"
+
+func autoBindAndIssuePassport(agentID string) string {
+	// Step 1: Generate Ed25519 keypair
+	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "passport: failed to generate Ed25519 key: " + err.Error()
+	}
+	pubKeyB64 := base64.RawURLEncoding.EncodeToString(pubKey)
+	kid := "ed25519-" + pubKeyB64[:8]
+
+	// Step 2: Request auth key challenge
+	challengeResp, err := apiPost(fmt.Sprintf("/agents/%s/auth-key/challenge", url.PathEscape(agentID)), map[string]any{
+		"alg": "Ed25519",
+	})
+	if err != nil {
+		return "passport: auth key challenge failed: " + err.Error()
+	}
+	var challenge struct {
+		ChallengeID string `json:"challenge_id"`
+		Message     struct {
+			Kind      string `json:"kind"`
+			AgentID   string `json:"agent_id"`
+			Nonce     string `json:"nonce"`
+			IssuedAt  string `json:"issued_at"`
+			ExpiresAt string `json:"expires_at"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(challengeResp, &challenge); err != nil {
+		return "passport: failed to parse challenge: " + err.Error()
+	}
+
+	// Step 3: Sign the challenge message
+	messageJSON, err := json.Marshal(challenge.Message)
+	if err != nil {
+		return "passport: failed to serialize challenge message: " + err.Error()
+	}
+	digestData := append([]byte(authKeyBindDomainPrefix), messageJSON...)
+	digest := sha256.Sum256(digestData)
+	signature := ed25519.Sign(privKey, digest[:])
+	sigB64 := base64.RawURLEncoding.EncodeToString(signature)
+
+	// Step 4: Verify auth key binding
+	_, err = apiPost(fmt.Sprintf("/agents/%s/auth-key/verify", url.PathEscape(agentID)), map[string]any{
+		"challenge_id": challenge.ChallengeID,
+		"key": map[string]any{
+			"kid": kid,
+			"alg": "Ed25519",
+			"public_key_jwk": map[string]any{
+				"kty": "OKP",
+				"crv": "Ed25519",
+				"x":   pubKeyB64,
+			},
+		},
+		"signature": sigB64,
+	})
+	if err != nil {
+		return "passport: auth key verify failed: " + err.Error()
+	}
+
+	// Step 5: Issue passport
+	_, err = apiPost(fmt.Sprintf("/agents/%s/credential", url.PathEscape(agentID)), map[string]any{})
+	if err != nil {
+		return "passport: issuance failed: " + err.Error()
+	}
+
+	return "" // success — no warning
 }
