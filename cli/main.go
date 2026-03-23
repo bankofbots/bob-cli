@@ -59,6 +59,14 @@ type cliConfig struct {
 	Platform string `json:"platform,omitempty"`
 	APIKey   string `json:"api_key,omitempty"`
 	AgentID  string `json:"agent_id,omitempty"`
+
+	// Wallet keys (generated during bob init, stored locally — never sent to BOB)
+	EVMPrivateKey string `json:"evm_private_key,omitempty"`
+	EVMAddress    string `json:"evm_address,omitempty"`
+	BTCPrivateKey string `json:"btc_private_key,omitempty"`
+	BTCAddress    string `json:"btc_address,omitempty"`
+	SOLPrivateKey string `json:"sol_private_key,omitempty"`
+	SOLAddress    string `json:"sol_address,omitempty"`
 }
 
 func validPlatform(raw string) bool {
@@ -1238,6 +1246,44 @@ func commandTree() CommandInfo {
 				},
 			},
 			{
+				Name:        "wallet",
+				Description: "Manage agent wallets (non-custodial)",
+				Children: []CommandInfo{
+					{Name: "list", Description: "List registered wallets for an agent", Usage: "bob wallet list [--agent-id <id>]"},
+					{Name: "balance", Description: "Show proven balance from verified proofs", Usage: "bob wallet balance [--agent-id <id>]"},
+					{Name: "credit-limit", Description: "Show computed credit limit (score x balance x age)", Usage: "bob wallet credit-limit [--agent-id <id>]"},
+					{
+						Name:        "register",
+						Description: "Register a wallet address for an agent",
+						Usage:       "bob wallet register --rail <evm|btc|solana> --address <addr> [--agent-id <id>]",
+						Flags: []FlagInfo{
+							{Name: "rail", Type: "string", Required: true, Description: "Chain rail: evm, btc, or solana"},
+							{Name: "address", Type: "string", Required: true, Description: "Wallet address to register"},
+						},
+					},
+					{Name: "addresses", Description: "Show locally generated wallet addresses", Usage: "bob wallet addresses"},
+					{Name: "provision-check", Description: "Check for and fulfill pending wallet provision requests from the dashboard", Usage: "bob wallet provision-check [--agent-id <id>]"},
+				},
+			},
+			{
+				Name:        "loan",
+				Description: "P2P loan marketplace",
+				Children: []CommandInfo{
+					{
+						Name:        "offer create",
+						Description: "Create a loan offer",
+						Usage:       "bob loan offer create --agent-id <id> --safe <addr> --amount <usdc> --rate <bps> --min-score <n> --duration <days>",
+					},
+					{Name: "offer list", Description: "List your loan offers", Usage: "bob loan offer list [--agent-id <id>]"},
+					{Name: "marketplace", Description: "Browse active loan offers", Usage: "bob loan marketplace [--limit <n>]"},
+					{Name: "accept", Description: "Accept a loan offer", Usage: "bob loan accept <offer-id> --amount <usdc> [--agent-id <id>]"},
+					{Name: "draw", Description: "Record a loan drawdown", Usage: "bob loan draw <loan-id> --tx <hash> [--agent-id <id>]"},
+					{Name: "repay", Description: "Record a loan repayment", Usage: "bob loan repay <loan-id> --tx <hash> --amount <usdc> [--agent-id <id>]"},
+					{Name: "list", Description: "List your loans", Usage: "bob loan list [--agent-id <id>]"},
+					{Name: "status", Description: "Show loan status", Usage: "bob loan status <loan-id> [--agent-id <id>]"},
+				},
+			},
+			{
 				Name:        "api-key",
 				Description: "Manage operator API keys",
 				Children: []CommandInfo{
@@ -1390,6 +1436,8 @@ func main() {
 	root.AddCommand(inboxCmd())
 	root.AddCommand(apiKeyCmd())
 	root.AddCommand(registerCmd())
+	root.AddCommand(walletCmd())
+	root.AddCommand(loanCmd())
 
 	if err := root.Execute(); err != nil {
 		emitError("bob", err)
@@ -1787,26 +1835,46 @@ func initSession(cmd *cobra.Command, args []string) error {
 	apiBase = normalizedAPIBase
 	apiKey = initAPIKey
 	passportResult := autoBindAndIssuePassport(agentID)
-	apiBase = savedBase
-	apiKey = savedKey
 	if passportResult != "" {
 		warnings = append(warnings, passportResult)
+	}
+
+	// Auto-generate multi-chain wallet keys and register addresses (best-effort).
+	// Keys are stored locally in config — BOB only receives public addresses.
+	walletData := map[string]any{}
+	walletResult := autoGenerateAndRegisterWallets(agentID)
+	if walletResult.err != "" {
+		warnings = append(warnings, walletResult.err)
+	} else {
+		walletData = map[string]any{
+			"evm_address": walletResult.evmAddress,
+			"btc_address": walletResult.btcAddress,
+			"sol_address": walletResult.solAddress,
+		}
+	}
+
+	apiBase = savedBase
+	apiKey = savedKey
+
+	initData := map[string]any{
+		"platform":         platform,
+		"initialized_as":   fmt.Sprintf("platform=%s", platform),
+		"agent_id":         agentID,
+		"api_key_redacted": redactKey(initAPIKey),
+		"api_key_hidden":   !shouldPrintAPIKey,
+		"api_url":          normalizedAPIBase,
+		"config_file":      activeCLIConfigPath(),
+		"warnings":         warnings,
+		"env":              envCommands,
+	}
+	if len(walletData) > 0 {
+		initData["wallets"] = walletData
 	}
 
 	emit(Envelope{
 		OK:      true,
 		Command: "bob init",
-		Data: map[string]any{
-			"platform":         platform,
-			"initialized_as":   fmt.Sprintf("platform=%s", platform),
-			"agent_id":         agentID,
-			"api_key_redacted": redactKey(initAPIKey),
-			"api_key_hidden":   !shouldPrintAPIKey,
-			"api_url":          normalizedAPIBase,
-			"config_file":      activeCLIConfigPath(),
-			"warnings":         warnings,
-			"env":              envCommands,
-		},
+		Data:    initData,
 		NextActions: nextActions,
 	})
 	return nil
@@ -3950,6 +4018,35 @@ func bindingCmd() *cobra.Command {
 	evmVerifyCmd.MarkFlagRequired("signature")
 	cmd.AddCommand(evmVerifyCmd)
 
+	// Generic challenge/verify for any rail (btc, solana, etc.)
+	challengeCmd := &cobra.Command{
+		Use:   "challenge",
+		Short: "Create a wallet ownership challenge for any rail",
+		Args:  cobra.NoArgs,
+		RunE:  operatorGenericBindChallenge,
+	}
+	challengeCmd.Flags().String("rail", "", "Rail: evm, btc, or solana (required)")
+	challengeCmd.Flags().String("address", "", "Wallet address (required)")
+	challengeCmd.MarkFlagRequired("rail")
+	challengeCmd.MarkFlagRequired("address")
+	cmd.AddCommand(challengeCmd)
+
+	verifyCmd := &cobra.Command{
+		Use:   "verify",
+		Short: "Verify a wallet ownership challenge with a signature",
+		Args:  cobra.NoArgs,
+		RunE:  operatorGenericBindVerify,
+	}
+	verifyCmd.Flags().String("rail", "", "Rail: evm, btc, or solana (required)")
+	verifyCmd.Flags().String("challenge-id", "", "Challenge id (required)")
+	verifyCmd.Flags().String("address", "", "Wallet address (required)")
+	verifyCmd.Flags().String("signature", "", "Signature over challenge message (required)")
+	verifyCmd.MarkFlagRequired("rail")
+	verifyCmd.MarkFlagRequired("challenge-id")
+	verifyCmd.MarkFlagRequired("address")
+	verifyCmd.MarkFlagRequired("signature")
+	cmd.AddCommand(verifyCmd)
+
 	return cmd
 }
 
@@ -4013,6 +4110,67 @@ func operatorEVMBindVerify(cmd *cobra.Command, args []string) error {
 		Data:    json.RawMessage(data),
 		NextActions: []NextAction{
 			{Command: "bob score me", Description: "Check updated BOB Score with wallet binding signal"},
+		},
+	})
+	return nil
+}
+
+// --- Generic wallet binding handlers (any rail) ---
+
+func operatorGenericBindChallenge(cmd *cobra.Command, args []string) error {
+	rail, _ := cmd.Flags().GetString("rail")
+	address, _ := cmd.Flags().GetString("address")
+	rail = strings.ToLower(strings.TrimSpace(rail))
+	address = strings.TrimSpace(address)
+
+	data, err := apiPost(fmt.Sprintf("/operators/me/wallet-bindings/%s/challenge", url.PathEscape(rail)), map[string]any{
+		"address": address,
+	})
+	if err != nil {
+		emitErrorWithActions("bob binding challenge", err, []NextAction{
+			{Command: "bob auth me", Description: "Verify operator credentials"},
+		})
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob binding challenge",
+		Data:    json.RawMessage(data),
+		NextActions: []NextAction{
+			{Command: fmt.Sprintf("bob binding verify --rail %s --challenge-id <id> --address %s --signature <sig>", rail, address), Description: "Sign the challenge message and submit"},
+		},
+	})
+	return nil
+}
+
+func operatorGenericBindVerify(cmd *cobra.Command, args []string) error {
+	rail, _ := cmd.Flags().GetString("rail")
+	challengeID, _ := cmd.Flags().GetString("challenge-id")
+	address, _ := cmd.Flags().GetString("address")
+	signature, _ := cmd.Flags().GetString("signature")
+	rail = strings.ToLower(strings.TrimSpace(rail))
+
+	payload := map[string]any{
+		"challenge_id": strings.TrimSpace(challengeID),
+		"address":      strings.TrimSpace(address),
+		"signature":    strings.TrimSpace(signature),
+	}
+
+	data, err := apiPost(fmt.Sprintf("/operators/me/wallet-bindings/%s/verify", url.PathEscape(rail)), payload)
+	if err != nil {
+		emitErrorWithActions("bob binding verify", err, []NextAction{
+			{Command: fmt.Sprintf("bob binding challenge --rail %s --address %s", rail, address), Description: "Create a fresh challenge"},
+		})
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob binding verify",
+		Data:    json.RawMessage(data),
+		NextActions: []NextAction{
+			{Command: "bob score me", Description: "Check updated BOB Score"},
 		},
 	})
 	return nil
@@ -4337,6 +4495,439 @@ func operatorAPIKeyRevoke(cmd *cobra.Command, args []string) error {
 // ---------------------------------------------------------------------------
 // Auto-passport: generate Ed25519 key, bind, issue passport during init
 // ---------------------------------------------------------------------------
+// Wallet commands: bob wallet {list, balance, credit-limit, register}
+// ---------------------------------------------------------------------------
+
+type walletInitResult struct {
+	evmAddress string
+	btcAddress string
+	solAddress string
+	err        string
+}
+
+func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
+	// Check if keys already exist in config
+	cfg, loadErr := loadCLIConfig()
+	if loadErr == nil && cfg.EVMAddress != "" {
+		// Already generated — re-register (idempotent, server returns 409 on dup)
+		registerWalletBestEffort(agentID, "evm", cfg.EVMAddress)
+		registerWalletBestEffort(agentID, "btc", cfg.BTCAddress)
+		registerWalletBestEffort(agentID, "solana", cfg.SOLAddress)
+		return walletInitResult{
+			evmAddress: cfg.EVMAddress,
+			btcAddress: cfg.BTCAddress,
+			solAddress: cfg.SOLAddress,
+		}
+	}
+
+	// Detect BTC network from API URL: localhost → regtest, testnet → testnet, else mainnet.
+	btcHRP := "bc"
+	loweredBase := strings.ToLower(apiBase)
+	if strings.Contains(loweredBase, "localhost") || strings.Contains(loweredBase, "127.0.0.1") {
+		btcHRP = "bcrt"
+	} else if strings.Contains(loweredBase, "testnet") {
+		btcHRP = "tb"
+	}
+
+	keys, err := generateWalletKeys(btcHRP)
+	if err != nil {
+		return walletInitResult{err: "wallet: keygen failed: " + err.Error()}
+	}
+
+	// Persist private keys to config (never leaves the machine)
+	if loadErr == nil {
+		cfg.EVMPrivateKey = keys.EVMPrivateKey
+		cfg.EVMAddress = keys.EVMAddress
+		cfg.BTCPrivateKey = keys.BTCPrivateKey
+		cfg.BTCAddress = keys.BTCAddress
+		cfg.SOLPrivateKey = keys.SOLPrivateKey
+		cfg.SOLAddress = keys.SOLAddress
+		if writeErr := writeCLIConfig(cliConfigPath(), cfg); writeErr != nil {
+			return walletInitResult{err: "wallet: failed to save keys to config: " + writeErr.Error()}
+		}
+	}
+
+	// Register addresses with BOB (best-effort — 409 is fine, 403 means no trust signal yet)
+	var regWarnings []string
+	for _, entry := range []struct{ rail, addr string }{
+		{"evm", keys.EVMAddress},
+		{"btc", keys.BTCAddress},
+		{"solana", keys.SOLAddress},
+	} {
+		if w := registerWalletBestEffort(agentID, entry.rail, entry.addr); w != "" {
+			regWarnings = append(regWarnings, w)
+		}
+	}
+
+	result := walletInitResult{
+		evmAddress: keys.EVMAddress,
+		btcAddress: keys.BTCAddress,
+		solAddress: keys.SOLAddress,
+	}
+	if len(regWarnings) > 0 {
+		result.err = "wallet registration: " + strings.Join(regWarnings, "; ")
+	}
+	return result
+}
+
+func registerWalletBestEffort(agentID, rail, address string) string {
+	if address == "" {
+		return ""
+	}
+	_, err := apiPost(fmt.Sprintf("/agents/%s/wallets", url.PathEscape(agentID)), map[string]any{
+		"rail":    rail,
+		"address": address,
+	})
+	if err == nil {
+		return ""
+	}
+	// 409 (duplicate) is expected on re-init — don't warn
+	if strings.Contains(err.Error(), "409") {
+		return ""
+	}
+	// 403 (no trust signal) is expected before wallet binding — gentle hint
+	if strings.Contains(err.Error(), "403") {
+		return fmt.Sprintf("%s: bind wallet first (bob binding %s-challenge)", rail, rail)
+	}
+	return fmt.Sprintf("%s: %s", rail, extractAPIErrorMessage(err))
+}
+
+func walletCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "wallet",
+		Short: "Manage agent wallets (non-custodial)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			emit(Envelope{
+				OK:      true,
+				Command: "bob wallet",
+				Data: map[string]any{
+					"subcommands": []string{"list", "balance", "credit-limit", "register", "addresses"},
+				},
+				NextActions: []NextAction{
+					{Command: "bob wallet list", Description: "List registered wallets for an agent"},
+					{Command: "bob wallet balance", Description: "Show proven balance from verified proofs"},
+					{Command: "bob wallet credit-limit", Description: "Show computed credit limit"},
+					{Command: "bob wallet addresses", Description: "Show locally generated wallet addresses"},
+				},
+			})
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	// bob wallet list
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List registered wallets for an agent",
+		RunE:  runWalletList,
+	}
+	listCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	cmd.AddCommand(listCmd)
+
+	// bob wallet balance
+	balanceCmd := &cobra.Command{
+		Use:   "balance",
+		Short: "Show proven balance from verified payment proofs",
+		RunE:  runWalletBalance,
+	}
+	balanceCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	cmd.AddCommand(balanceCmd)
+
+	// bob wallet credit-limit
+	creditCmd := &cobra.Command{
+		Use:   "credit-limit",
+		Short: "Show computed credit limit (score × balance × age)",
+		RunE:  runWalletCreditLimit,
+	}
+	creditCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	cmd.AddCommand(creditCmd)
+
+	// bob wallet register
+	registerCmd := &cobra.Command{
+		Use:   "register",
+		Short: "Register a wallet address for an agent",
+		RunE:  runWalletRegister,
+	}
+	registerCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	registerCmd.Flags().String("rail", "", "Chain rail: evm, btc, or solana")
+	registerCmd.Flags().String("address", "", "Wallet address to register")
+	registerCmd.MarkFlagRequired("rail")
+	registerCmd.MarkFlagRequired("address")
+	cmd.AddCommand(registerCmd)
+
+	// bob wallet addresses
+	addressesCmd := &cobra.Command{
+		Use:   "addresses",
+		Short: "Show locally generated wallet addresses (from config)",
+		RunE:  runWalletAddresses,
+	}
+	cmd.AddCommand(addressesCmd)
+
+	// bob wallet provision-check
+	provisionCheckCmd := &cobra.Command{
+		Use:   "provision-check",
+		Short: "Check for and fulfill pending wallet provision requests",
+		Long: `Polls for pending wallet provision requests created by the operator
+from the dashboard. For each pending request, generate a wallet locally for the
+requested rail, register it with 'bob wallet register', then the request is
+auto-fulfilled.`,
+		RunE: runWalletProvisionCheck,
+	}
+	provisionCheckCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	cmd.AddCommand(provisionCheckCmd)
+
+	return cmd
+}
+
+func resolveAgentID(cmd *cobra.Command) string {
+	if id, _ := cmd.Flags().GetString("agent-id"); strings.TrimSpace(id) != "" {
+		return strings.TrimSpace(id)
+	}
+	cfg, err := loadCLIConfig()
+	if err == nil && strings.TrimSpace(cfg.AgentID) != "" {
+		return strings.TrimSpace(cfg.AgentID)
+	}
+	return strings.TrimSpace(os.Getenv("BOB_AGENT_ID"))
+}
+
+var noAgentIDActions = []NextAction{
+	{Command: "bob init --code <claim-code>", Description: "Initialize agent session (sets agent_id in config)"},
+	{Command: "export BOB_AGENT_ID=<agent-id>", Description: "Set agent ID via environment variable"},
+}
+
+func runWalletList(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob wallet list", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/wallets", url.PathEscape(agentID)))
+	if err != nil {
+		emitError("bob wallet list", err)
+		return nil
+	}
+
+	var wallets []json.RawMessage
+	if err := json.Unmarshal(resp, &wallets); err != nil {
+		emitError("bob wallet list", fmt.Errorf("failed to parse wallets: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet list",
+		Data: map[string]any{
+			"agent_id": agentID,
+			"wallets":  wallets,
+			"count":    len(wallets),
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet balance --agent-id " + agentID, Description: "View proven balance"},
+			{Command: "bob wallet credit-limit --agent-id " + agentID, Description: "View credit limit"},
+		},
+	})
+	return nil
+}
+
+func runWalletBalance(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob wallet balance", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/balance", url.PathEscape(agentID)))
+	if err != nil {
+		emitError("bob wallet balance", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob wallet balance", fmt.Errorf("failed to parse balance: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet balance",
+		Data: map[string]any{
+			"agent_id": agentID,
+			"balance":  result,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet credit-limit --agent-id " + agentID, Description: "View credit limit"},
+			{Command: "bob wallet list --agent-id " + agentID, Description: "List registered wallets"},
+		},
+	})
+	return nil
+}
+
+func runWalletCreditLimit(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob wallet credit-limit", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/credit-limit", url.PathEscape(agentID)))
+	if err != nil {
+		emitError("bob wallet credit-limit", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob wallet credit-limit", fmt.Errorf("failed to parse credit limit: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet credit-limit",
+		Data: map[string]any{
+			"agent_id":     agentID,
+			"credit_limit": result,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet balance --agent-id " + agentID, Description: "View proven balance"},
+			{Command: "bob wallet list --agent-id " + agentID, Description: "List registered wallets"},
+		},
+	})
+	return nil
+}
+
+func runWalletRegister(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob wallet register", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	rail, _ := cmd.Flags().GetString("rail")
+	address, _ := cmd.Flags().GetString("address")
+
+	resp, err := apiPost(fmt.Sprintf("/agents/%s/wallets", url.PathEscape(agentID)), map[string]any{
+		"rail":    strings.ToLower(strings.TrimSpace(rail)),
+		"address": strings.TrimSpace(address),
+	})
+	if err != nil {
+		emitError("bob wallet register", err)
+		return nil
+	}
+
+	var wallet json.RawMessage
+	if err := json.Unmarshal(resp, &wallet); err != nil {
+		emitError("bob wallet register", fmt.Errorf("failed to parse wallet: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet register",
+		Data: map[string]any{
+			"agent_id": agentID,
+			"wallet":   wallet,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet list --agent-id " + agentID, Description: "List all registered wallets"},
+		},
+	})
+	return nil
+}
+
+func runWalletAddresses(cmd *cobra.Command, args []string) error {
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		emitError("bob wallet addresses", fmt.Errorf("failed to load config: %w", err))
+		return nil
+	}
+
+	if cfg.EVMAddress == "" && cfg.BTCAddress == "" && cfg.SOLAddress == "" {
+		emitError("bob wallet addresses", fmt.Errorf("no wallet keys found in config — run bob init to generate"))
+		return nil
+	}
+
+	addresses := map[string]any{}
+	if cfg.EVMAddress != "" {
+		addresses["evm"] = map[string]any{
+			"address": cfg.EVMAddress,
+			"chains":  []string{"Ethereum", "Base (USDC)"},
+		}
+	}
+	if cfg.BTCAddress != "" {
+		addresses["btc"] = map[string]any{
+			"address": cfg.BTCAddress,
+			"chains":  []string{"Bitcoin (bech32)"},
+		}
+	}
+	if cfg.SOLAddress != "" {
+		addresses["solana"] = map[string]any{
+			"address": cfg.SOLAddress,
+			"chains":  []string{"Solana"},
+		}
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet addresses",
+		Data: map[string]any{
+			"config_file": activeCLIConfigPath(),
+			"addresses":   addresses,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet list", Description: "List wallets registered with BOB"},
+			{Command: "bob wallet balance", Description: "View proven balance"},
+		},
+	})
+	return nil
+}
+
+func runWalletProvisionCheck(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob wallet provision-check", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/wallet-provision-requests?status=pending", url.PathEscape(agentID)))
+	if err != nil {
+		emitError("bob wallet provision-check", err)
+		return nil
+	}
+
+	var requests []struct {
+		ID   string `json:"id"`
+		Rail string `json:"rail"`
+	}
+	_ = json.Unmarshal(resp, &requests)
+
+	nextActions := make([]NextAction, 0, len(requests)+1)
+	for _, req := range requests {
+		nextActions = append(nextActions, NextAction{
+			Command:     fmt.Sprintf("bob wallet register --rail %s --address <generated-address> --agent-id %s", req.Rail, agentID),
+			Description: fmt.Sprintf("Generate a %s wallet, then register it to fulfill request %s", strings.ToUpper(req.Rail), req.ID),
+		})
+	}
+	if len(requests) == 0 {
+		nextActions = append(nextActions, NextAction{
+			Command:     "bob wallet list --agent-id " + agentID,
+			Description: "No pending requests — list existing wallets",
+		})
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet provision-check",
+		Data:    json.RawMessage(resp),
+		NextActions: nextActions,
+	})
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 
 const authKeyBindDomainPrefix = "BOB Passport Auth v1\n"
 
@@ -4347,7 +4938,9 @@ func autoBindAndIssuePassport(agentID string) string {
 		return "passport: failed to generate Ed25519 key: " + err.Error()
 	}
 	pubKeyB64 := base64.RawURLEncoding.EncodeToString(pubKey)
-	kid := "ed25519-" + pubKeyB64[:8]
+	// "persistent" signals the key is stored locally and can be used for
+	// merchant challenge-response auth (unlike browser "ephemeral" keys).
+	kid := "ed25519-persistent-" + pubKeyB64[:8]
 
 	// Step 2: Request auth key challenge
 	challengeResp, err := apiPost(fmt.Sprintf("/agents/%s/auth-key/challenge", url.PathEscape(agentID)), map[string]any{
@@ -4405,4 +4998,466 @@ func autoBindAndIssuePassport(agentID string) string {
 	}
 
 	return "" // success — no warning
+}
+
+// ---------------------------------------------------------------------------
+// bob loan — P2P loan marketplace commands
+// ---------------------------------------------------------------------------
+
+func loanCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "loan",
+		Short: "P2P loan marketplace",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			emit(Envelope{
+				OK:      true,
+				Command: "bob loan",
+				Data: map[string]any{
+					"subcommands": []string{"offer", "marketplace", "accept", "draw", "repay", "list", "status"},
+				},
+				NextActions: []NextAction{
+					{Command: "bob loan marketplace", Description: "Browse active loan offers"},
+					{Command: "bob loan offer create", Description: "Create a loan offer"},
+					{Command: "bob loan list", Description: "List your loans"},
+				},
+			})
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	// --- bob loan offer ---
+	offerCmd := &cobra.Command{
+		Use:   "offer",
+		Short: "Manage loan offers",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			emit(Envelope{
+				OK:      true,
+				Command: "bob loan offer",
+				Data:    map[string]any{"subcommands": []string{"create", "list"}},
+				NextActions: []NextAction{
+					{Command: "bob loan offer create", Description: "Create a loan offer"},
+					{Command: "bob loan offer list", Description: "List your loan offers"},
+				},
+			})
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	// bob loan offer create
+	offerCreateCmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create a loan offer",
+		RunE:  runLoanOfferCreate,
+	}
+	offerCreateCmd.Flags().String("agent-id", "", "Lender agent ID")
+	offerCreateCmd.Flags().String("safe", "", "Safe/wallet address for funding")
+	offerCreateCmd.Flags().Int64("amount", 0, "Max loan amount in USDC (smallest unit)")
+	offerCreateCmd.Flags().Int("rate", 0, "Interest rate in basis points")
+	offerCreateCmd.Flags().Int("min-score", 0, "Minimum borrower BOB Score")
+	offerCreateCmd.Flags().Int("duration", 0, "Loan duration in days")
+	offerCreateCmd.Flags().Int("grace-period", 3, "Grace period in days after maturity")
+	offerCreateCmd.Flags().String("chain-id", "8453", "Chain ID (default Base L2)")
+	offerCreateCmd.Flags().String("token-address", "", "Token contract address (USDC)")
+	_ = offerCreateCmd.MarkFlagRequired("safe")
+	_ = offerCreateCmd.MarkFlagRequired("amount")
+	_ = offerCreateCmd.MarkFlagRequired("rate")
+	_ = offerCreateCmd.MarkFlagRequired("duration")
+	offerCmd.AddCommand(offerCreateCmd)
+
+	// bob loan offer list
+	offerListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List your loan offers",
+		RunE:  runLoanOfferList,
+	}
+	offerListCmd.Flags().String("agent-id", "", "Lender agent ID")
+	offerListCmd.Flags().Int("limit", 30, "Max results")
+	offerListCmd.Flags().Int("offset", 0, "Offset")
+	offerCmd.AddCommand(offerListCmd)
+
+	cmd.AddCommand(offerCmd)
+
+	// --- bob loan marketplace ---
+	marketplaceCmd := &cobra.Command{
+		Use:   "marketplace",
+		Short: "Browse active loan offers",
+		RunE:  runLoanMarketplace,
+	}
+	marketplaceCmd.Flags().Int("limit", 30, "Max results")
+	marketplaceCmd.Flags().Int("offset", 0, "Offset")
+	cmd.AddCommand(marketplaceCmd)
+
+	// --- bob loan accept ---
+	acceptCmd := &cobra.Command{
+		Use:   "accept [offer-id]",
+		Short: "Accept a loan offer",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runLoanAccept,
+	}
+	acceptCmd.Flags().String("agent-id", "", "Borrower agent ID")
+	acceptCmd.Flags().Int64("amount", 0, "Amount to borrow in USDC (smallest unit)")
+	_ = acceptCmd.MarkFlagRequired("amount")
+	cmd.AddCommand(acceptCmd)
+
+	// --- bob loan draw ---
+	drawCmd := &cobra.Command{
+		Use:   "draw [loan-id]",
+		Short: "Record a loan drawdown (funding tx)",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runLoanDraw,
+	}
+	drawCmd.Flags().String("agent-id", "", "Agent ID")
+	drawCmd.Flags().String("tx", "", "Funding transaction hash")
+	_ = drawCmd.MarkFlagRequired("tx")
+	cmd.AddCommand(drawCmd)
+
+	// --- bob loan repay ---
+	repayCmd := &cobra.Command{
+		Use:   "repay [loan-id]",
+		Short: "Record a loan repayment",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runLoanRepay,
+	}
+	repayCmd.Flags().String("agent-id", "", "Agent ID")
+	repayCmd.Flags().String("tx", "", "Repayment transaction hash")
+	repayCmd.Flags().Int64("amount", 0, "Repayment amount in USDC (smallest unit)")
+	_ = repayCmd.MarkFlagRequired("tx")
+	_ = repayCmd.MarkFlagRequired("amount")
+	cmd.AddCommand(repayCmd)
+
+	// --- bob loan list ---
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List your loans (as borrower or lender)",
+		RunE:  runLoanList,
+	}
+	listCmd.Flags().String("agent-id", "", "Agent ID")
+	listCmd.Flags().Int("limit", 30, "Max results")
+	listCmd.Flags().Int("offset", 0, "Offset")
+	cmd.AddCommand(listCmd)
+
+	// --- bob loan status ---
+	statusCmd := &cobra.Command{
+		Use:   "status [loan-id]",
+		Short: "Show detailed loan status",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runLoanStatus,
+	}
+	statusCmd.Flags().String("agent-id", "", "Agent ID")
+	cmd.AddCommand(statusCmd)
+
+	return cmd
+}
+
+func runLoanOfferCreate(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan offer create", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	safe, _ := cmd.Flags().GetString("safe")
+	amount, _ := cmd.Flags().GetInt64("amount")
+	rate, _ := cmd.Flags().GetInt("rate")
+	minScore, _ := cmd.Flags().GetInt("min-score")
+	duration, _ := cmd.Flags().GetInt("duration")
+	gracePeriod, _ := cmd.Flags().GetInt("grace-period")
+	chainID, _ := cmd.Flags().GetString("chain-id")
+	tokenAddress, _ := cmd.Flags().GetString("token-address")
+
+	payload := map[string]any{
+		"safe_address":     safe,
+		"max_amount":       amount,
+		"interest_rate_bps": rate,
+		"min_borrower_score": minScore,
+		"duration_days":    duration,
+		"grace_period_days": gracePeriod,
+		"chain_id":         chainID,
+		"currency":         "USDC",
+	}
+	if tokenAddress != "" {
+		payload["token_address"] = tokenAddress
+	}
+
+	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/offers", url.PathEscape(agentID)), payload)
+	if err != nil {
+		emitError("bob loan offer create", err)
+		return nil
+	}
+
+	var offer json.RawMessage
+	if err := json.Unmarshal(resp, &offer); err != nil {
+		emitError("bob loan offer create", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan offer create",
+		Data:    offer,
+		NextActions: []NextAction{
+			{Command: "bob loan offer list --agent-id " + agentID, Description: "List your loan offers"},
+			{Command: "bob loan marketplace", Description: "Browse all active offers"},
+		},
+	})
+	return nil
+}
+
+func runLoanOfferList(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan offer list", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	limit, _ := cmd.Flags().GetInt("limit")
+	offset, _ := cmd.Flags().GetInt("offset")
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/loans/offers?limit=%d&offset=%d",
+		url.PathEscape(agentID), limit, offset))
+	if err != nil {
+		emitError("bob loan offer list", err)
+		return nil
+	}
+
+	var offers []json.RawMessage
+	if err := json.Unmarshal(resp, &offers); err != nil {
+		emitError("bob loan offer list", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan offer list",
+		Data: map[string]any{
+			"agent_id": agentID,
+			"offers":   offers,
+			"count":    len(offers),
+		},
+		NextActions: []NextAction{
+			{Command: "bob loan offer create", Description: "Create a new loan offer"},
+			{Command: "bob loan marketplace", Description: "Browse all active offers"},
+		},
+	})
+	return nil
+}
+
+func runLoanMarketplace(cmd *cobra.Command, args []string) error {
+	limit, _ := cmd.Flags().GetInt("limit")
+	offset, _ := cmd.Flags().GetInt("offset")
+
+	resp, err := apiGet(fmt.Sprintf("/loans/marketplace?limit=%d&offset=%d", limit, offset))
+	if err != nil {
+		emitError("bob loan marketplace", err)
+		return nil
+	}
+
+	var offers []json.RawMessage
+	if err := json.Unmarshal(resp, &offers); err != nil {
+		emitError("bob loan marketplace", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan marketplace",
+		Data: map[string]any{
+			"offers": offers,
+			"count":  len(offers),
+		},
+		NextActions: []NextAction{
+			{Command: "bob loan accept <offer-id> --amount <usdc>", Description: "Accept a loan offer"},
+			{Command: "bob loan offer create", Description: "Create your own offer"},
+		},
+	})
+	return nil
+}
+
+func runLoanAccept(cmd *cobra.Command, args []string) error {
+	offerID := args[0]
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan accept", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	amount, _ := cmd.Flags().GetInt64("amount")
+
+	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/accept", url.PathEscape(agentID)), map[string]any{
+		"offer_id": offerID,
+		"amount":   amount,
+	})
+	if err != nil {
+		emitError("bob loan accept", err)
+		return nil
+	}
+
+	var loan json.RawMessage
+	if err := json.Unmarshal(resp, &loan); err != nil {
+		emitError("bob loan accept", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan accept",
+		Data:    loan,
+		NextActions: []NextAction{
+			{Command: "bob loan list --agent-id " + agentID, Description: "List your loans"},
+			{Command: "bob loan status <loan-id> --agent-id " + agentID, Description: "Check loan status"},
+		},
+	})
+	return nil
+}
+
+func runLoanDraw(cmd *cobra.Command, args []string) error {
+	loanID := args[0]
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan draw", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	txHash, _ := cmd.Flags().GetString("tx")
+
+	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/%s/draw",
+		url.PathEscape(agentID), url.PathEscape(loanID)), map[string]any{
+		"tx_hash": txHash,
+	})
+	if err != nil {
+		emitError("bob loan draw", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob loan draw", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan draw",
+		Data:    result,
+		NextActions: []NextAction{
+			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check loan status"},
+			{Command: "bob loan repay " + loanID + " --tx <hash> --amount <usdc>", Description: "Record a repayment"},
+		},
+	})
+	return nil
+}
+
+func runLoanRepay(cmd *cobra.Command, args []string) error {
+	loanID := args[0]
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan repay", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	txHash, _ := cmd.Flags().GetString("tx")
+	amount, _ := cmd.Flags().GetInt64("amount")
+
+	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/%s/repay",
+		url.PathEscape(agentID), url.PathEscape(loanID)), map[string]any{
+		"tx_hash": txHash,
+		"amount":  amount,
+	})
+	if err != nil {
+		emitError("bob loan repay", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob loan repay", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan repay",
+		Data:    result,
+		NextActions: []NextAction{
+			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check remaining balance"},
+			{Command: "bob loan list --agent-id " + agentID, Description: "List all loans"},
+		},
+	})
+	return nil
+}
+
+func runLoanList(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan list", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	limit, _ := cmd.Flags().GetInt("limit")
+	offset, _ := cmd.Flags().GetInt("offset")
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/loans?limit=%d&offset=%d",
+		url.PathEscape(agentID), limit, offset))
+	if err != nil {
+		emitError("bob loan list", err)
+		return nil
+	}
+
+	var loans []json.RawMessage
+	if err := json.Unmarshal(resp, &loans); err != nil {
+		emitError("bob loan list", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan list",
+		Data: map[string]any{
+			"agent_id": agentID,
+			"loans":    loans,
+			"count":    len(loans),
+		},
+		NextActions: []NextAction{
+			{Command: "bob loan status <loan-id> --agent-id " + agentID, Description: "View loan details"},
+			{Command: "bob loan marketplace", Description: "Browse available offers"},
+		},
+	})
+	return nil
+}
+
+func runLoanStatus(cmd *cobra.Command, args []string) error {
+	loanID := args[0]
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan status", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/loans/%s",
+		url.PathEscape(agentID), url.PathEscape(loanID)))
+	if err != nil {
+		emitError("bob loan status", err)
+		return nil
+	}
+
+	var loan json.RawMessage
+	if err := json.Unmarshal(resp, &loan); err != nil {
+		emitError("bob loan status", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan status",
+		Data:    loan,
+		NextActions: []NextAction{
+			{Command: "bob loan repay " + loanID + " --tx <hash> --amount <usdc> --agent-id " + agentID, Description: "Record a repayment"},
+			{Command: "bob loan list --agent-id " + agentID, Description: "List all loans"},
+		},
+	})
+	return nil
 }
