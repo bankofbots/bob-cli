@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.7.0"
+const version = "0.11.0"
 
 const defaultAPIBase = "http://localhost:8080/api/v1"
 
@@ -1262,7 +1262,7 @@ func commandTree() CommandInfo {
 						},
 					},
 					{Name: "addresses", Description: "Show locally generated wallet addresses", Usage: "bob wallet addresses"},
-					{Name: "provision-check", Description: "Check for and fulfill pending wallet provision requests from the dashboard", Usage: "bob wallet provision-check [--agent-id <id>]"},
+					{Name: "provision-check", Description: "Check for and fulfill pending wallet provision requests", Usage: "bob wallet provision-check [--once] [--poll] [--interval 30s] [--agent-id <id>]"},
 				},
 			},
 			{
@@ -2113,6 +2113,7 @@ func agentCmd() *cobra.Command {
 	createCmd.Flags().String("currency", "BTC", "Primary currency (BTC, USD, USDC)")
 	createCmd.Flags().StringSlice("currencies", nil, "Currencies to provision (overrides --currency)")
 	createCmd.Flags().Bool("auto-approve", false, "Immediately approve the agent")
+	createCmd.Flags().Bool("public-profile", false, "Make agent profile publicly visible")
 	createCmd.MarkFlagRequired("name")
 	cmd.AddCommand(createCmd)
 
@@ -3487,69 +3488,6 @@ func intentProofChallenge(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func intentNodeBindChallenge(cmd *cobra.Command, args []string) error {
-	agentID := args[0]
-	walletID, _ := cmd.Flags().GetString("wallet-id")
-	walletID = strings.TrimSpace(walletID)
-
-	payload := map[string]any{}
-	if walletID != "" {
-		payload["wallet_id"] = walletID
-	}
-	data, err := apiPost(fmt.Sprintf("/agents/%s/node-bindings/lightning/challenge", agentID), payload)
-	if err != nil {
-		emitErrorWithActions("bob binding lightning-challenge", err, []NextAction{
-			{Command: fmt.Sprintf("bob agent get %s", agentID), Description: "Check agent status and ensure a ready BTC lightning wallet"},
-			{Command: fmt.Sprintf("bob binding lightning-challenge %s --wallet-id <wallet-id>", agentID), Description: "Retry with an explicit wallet id"},
-		})
-		return nil
-	}
-
-	emit(Envelope{
-		OK:      true,
-		Command: "bob binding lightning-challenge",
-		Data:    json.RawMessage(data),
-		NextActions: []NextAction{
-			{Command: fmt.Sprintf("bob binding lightning-verify %s --challenge-id <challenge-id> --signature <signature>", agentID), Description: "Verify challenge using node signature over challenge.message"},
-		},
-	})
-	return nil
-}
-
-func intentNodeBindVerify(cmd *cobra.Command, args []string) error {
-	agentID := args[0]
-	challengeID, _ := cmd.Flags().GetString("challenge-id")
-	signature, _ := cmd.Flags().GetString("signature")
-	challengeID = strings.TrimSpace(challengeID)
-	signature = strings.TrimSpace(signature)
-	if challengeID == "" || signature == "" {
-		emitError("bob binding lightning-verify", fmt.Errorf("challenge-id and signature are required"))
-		return nil
-	}
-
-	payload := map[string]any{
-		"challenge_id": challengeID,
-		"signature":    signature,
-	}
-	data, err := apiPost(fmt.Sprintf("/agents/%s/node-bindings/lightning/verify", agentID), payload)
-	if err != nil {
-		emitErrorWithActions("bob binding lightning-verify", err, []NextAction{
-			{Command: fmt.Sprintf("bob binding lightning-challenge %s", agentID), Description: "Create a fresh challenge"},
-		})
-		return nil
-	}
-
-	emit(Envelope{
-		OK:      true,
-		Command: "bob binding lightning-verify",
-		Data:    json.RawMessage(data),
-		NextActions: []NextAction{
-			{Command: fmt.Sprintf("bob intent proof-challenge %s <intent-id> --txid <txid>", agentID), Description: "Create a proof ownership challenge"},
-		},
-	})
-	return nil
-}
-
 func intentSubmitProof(cmd *cobra.Command, args []string) error {
 	agentID := args[0]
 	intentID := args[1]
@@ -4330,6 +4268,29 @@ func inboxCmd() *cobra.Command {
 	eventsCmd.Flags().Int("limit", 50, "Max results")
 	cmd.AddCommand(eventsCmd)
 
+	// bob inbox check — generic command queue processor
+	checkCmd := &cobra.Command{
+		Use:   "check",
+		Short: "Process pending operator commands",
+		Long: `Polls the agent command queue and processes pending commands.
+
+Three modes:
+  (default)              Single check, exit. For cron/heartbeat/skill triggers.
+  --poll                 Blocking loop. For Docker/server agents.
+  --interval 30s         Polling interval (default 30s, only with --poll).
+
+Examples:
+  bob inbox check                              # single check
+  bob inbox check --poll                       # blocking loop
+  bob inbox check --poll --interval 10s        # custom interval`,
+		RunE: runInboxCheck,
+	}
+	checkCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	checkCmd.Flags().Bool("once", false, "Single check then exit (default behavior)")
+	checkCmd.Flags().Bool("poll", false, "Blocking loop — check repeatedly")
+	checkCmd.Flags().Duration("interval", 30*time.Second, "Polling interval (with --poll)")
+	cmd.AddCommand(checkCmd)
+
 	return cmd
 }
 
@@ -4668,13 +4629,21 @@ func walletCmd() *cobra.Command {
 	provisionCheckCmd := &cobra.Command{
 		Use:   "provision-check",
 		Short: "Check for and fulfill pending wallet provision requests",
-		Long: `Polls for pending wallet provision requests created by the operator
-from the dashboard. For each pending request, generate a wallet locally for the
-requested rail, register it with 'bob wallet register', then the request is
-auto-fulfilled.`,
+		Long: `Three modes:
+  --once (default)     Single check, exit. For cron/heartbeat/skill triggers.
+  --poll               Blocking loop. For Docker/server agents.
+  --interval 30s       Polling interval (default 30s, only with --poll).
+
+Examples:
+  bob wallet provision-check --once              # cron/heartbeat
+  bob wallet provision-check --poll              # long-running agent
+  bob wallet provision-check --poll --interval 10s`,
 		RunE: runWalletProvisionCheck,
 	}
 	provisionCheckCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	provisionCheckCmd.Flags().Bool("once", false, "Single check then exit (default behavior)")
+	provisionCheckCmd.Flags().Bool("poll", false, "Blocking loop — check repeatedly")
+	provisionCheckCmd.Flags().Duration("interval", 30*time.Second, "Polling interval (with --poll)")
 	cmd.AddCommand(provisionCheckCmd)
 
 	return cmd
@@ -4885,46 +4854,159 @@ func runWalletAddresses(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// runWalletProvisionCheck is an alias for bob inbox check — kept for backward compat.
 func runWalletProvisionCheck(cmd *cobra.Command, args []string) error {
+	return runInboxCheck(cmd, args)
+}
+
+// ---------------------------------------------------------------------------
+// bob inbox check — generic command queue processor
+// ---------------------------------------------------------------------------
+
+func runInboxCheck(cmd *cobra.Command, args []string) error {
 	agentID := resolveAgentID(cmd)
 	if agentID == "" {
-		emitErrorWithActions("bob wallet provision-check", fmt.Errorf("no agent ID"), noAgentIDActions)
+		emitErrorWithActions("bob inbox check", fmt.Errorf("no agent ID"), noAgentIDActions)
 		return nil
 	}
 
-	resp, err := apiGet(fmt.Sprintf("/agents/%s/wallet-provision-requests?status=pending", url.PathEscape(agentID)))
+	poll, _ := cmd.Flags().GetBool("poll")
+	interval, _ := cmd.Flags().GetDuration("interval")
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+
+	if poll {
+		fmt.Fprintf(os.Stderr, "polling for commands every %s (ctrl+c to stop)\n", interval)
+		for {
+			inboxCheckOnce(agentID)
+			time.Sleep(interval)
+		}
+	}
+
+	inboxCheckOnce(agentID)
+	return nil
+}
+
+func inboxCheckOnce(agentID string) {
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/commands?status=pending", url.PathEscape(agentID)))
 	if err != nil {
-		emitError("bob wallet provision-check", err)
-		return nil
+		emitError("bob inbox check", err)
+		return
 	}
 
-	var requests []struct {
-		ID   string `json:"id"`
-		Rail string `json:"rail"`
+	var commands []struct {
+		ID          string `json:"id"`
+		CommandType string `json:"command_type"`
+		Payload     string `json:"payload"`
 	}
-	_ = json.Unmarshal(resp, &requests)
+	_ = json.Unmarshal(resp, &commands)
 
-	nextActions := make([]NextAction, 0, len(requests)+1)
-	for _, req := range requests {
-		nextActions = append(nextActions, NextAction{
-			Command:     fmt.Sprintf("bob wallet register --rail %s --address <generated-address> --agent-id %s", req.Rail, agentID),
-			Description: fmt.Sprintf("Generate a %s wallet, then register it to fulfill request %s", strings.ToUpper(req.Rail), req.ID),
+	if len(commands) == 0 {
+		emit(Envelope{
+			OK:      true,
+			Command: "bob inbox check",
+			Data:    map[string]any{"pending": 0, "message": "no pending commands"},
 		})
+		return
 	}
-	if len(requests) == 0 {
-		nextActions = append(nextActions, NextAction{
-			Command:     "bob wallet list --agent-id " + agentID,
-			Description: "No pending requests — list existing wallets",
-		})
+
+	var processed []map[string]any
+	var failed []map[string]any
+
+	for _, cmd := range commands {
+		switch cmd.CommandType {
+		case "wallet.provision":
+			result, err := handleWalletProvisionCommand(agentID, cmd.ID, cmd.Payload)
+			if err != nil {
+				failed = append(failed, map[string]any{
+					"command_id":   cmd.ID,
+					"command_type": cmd.CommandType,
+					"error":        err.Error(),
+				})
+				// Mark as failed
+				_, _ = apiPatch(fmt.Sprintf("/agents/%s/commands/%s", url.PathEscape(agentID), url.PathEscape(cmd.ID)),
+					map[string]any{"status": "failed", "error_msg": err.Error()})
+			} else {
+				processed = append(processed, result)
+			}
+		default:
+			failed = append(failed, map[string]any{
+				"command_id":   cmd.ID,
+				"command_type": cmd.CommandType,
+				"error":        "unknown command type",
+			})
+		}
 	}
 
 	emit(Envelope{
 		OK:      true,
-		Command: "bob wallet provision-check",
-		Data:    json.RawMessage(resp),
-		NextActions: nextActions,
+		Command: "bob inbox check",
+		Data: map[string]any{
+			"processed": processed,
+			"failed":    failed,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet list --agent-id " + agentID, Description: "List all registered wallets"},
+		},
 	})
-	return nil
+}
+
+// handleWalletProvisionCommand processes a wallet.provision command.
+func handleWalletProvisionCommand(agentID, commandID, payloadStr string) (map[string]any, error) {
+	var payload struct {
+		Rail string `json:"rail"`
+	}
+	if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+	if payload.Rail == "" {
+		return nil, fmt.Errorf("payload missing rail field")
+	}
+
+	// Load local address for this rail
+	cfg, cfgErr := loadCLIConfig()
+	if cfgErr != nil {
+		return nil, fmt.Errorf("failed to load config: %w", cfgErr)
+	}
+	addrMap := map[string]string{
+		"evm":    cfg.EVMAddress,
+		"btc":    cfg.BTCAddress,
+		"solana": cfg.SOLAddress,
+	}
+	addr := addrMap[payload.Rail]
+	if addr == "" {
+		return nil, fmt.Errorf("no local address for rail %s — run bob init to generate keys", payload.Rail)
+	}
+
+	// Register wallet with the command ID for auth bypass
+	walletPayload := map[string]any{
+		"rail":                  payload.Rail,
+		"address":              addr,
+		"provision_request_id": commandID,
+	}
+	walletResp, err := apiPost(fmt.Sprintf("/agents/%s/wallets", url.PathEscape(agentID)), walletPayload)
+	if err != nil {
+		return nil, fmt.Errorf("wallet registration failed: %w", err)
+	}
+
+	var wallet struct {
+		ID      string `json:"id"`
+		Address string `json:"address"`
+	}
+	_ = json.Unmarshal(walletResp, &wallet)
+
+	// Mark command as completed
+	_, _ = apiPatch(fmt.Sprintf("/agents/%s/commands/%s", url.PathEscape(agentID), url.PathEscape(commandID)),
+		map[string]any{"status": "completed", "result": map[string]any{"wallet_id": wallet.ID, "address": wallet.Address}})
+
+	return map[string]any{
+		"command_id":   commandID,
+		"command_type": "wallet.provision",
+		"rail":         payload.Rail,
+		"wallet_id":    wallet.ID,
+		"address":      wallet.Address,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
