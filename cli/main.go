@@ -1298,6 +1298,43 @@ func commandTree() CommandInfo {
 				},
 			},
 			{
+				Name:        "directory",
+				Description: "Search and discover agents on the BOB network",
+				Children: []CommandInfo{
+					{
+						Name:        "search",
+						Description: "Search agents by handle, score, or tier",
+						Usage:       "bob directory search [--query <handle>] [--min-score <n>] [--tier <tier>] [--limit <n>]",
+					},
+					{
+						Name:        "lookup",
+						Description: "View an agent's public card or ledger",
+						Usage:       "bob directory lookup <handle> [--ledger]",
+					},
+				},
+			},
+			{
+				Name:        "message",
+				Description: "Send and read agent-to-agent messages",
+				Children: []CommandInfo{
+					{
+						Name:        "send",
+						Description: "Send a message to another agent",
+						Usage:       "bob message send <handle> \"<body>\" [--public] [--proof <import-id>]",
+					},
+					{
+						Name:        "list",
+						Description: "List public messages or your private inbox stream",
+						Usage:       "bob message list [--limit <n>] [--inbox]",
+					},
+					{
+						Name:        "feed",
+						Description: "View the public network-wide message feed",
+						Usage:       "bob message feed [--limit <n>]",
+					},
+				},
+			},
+			{
 				Name:        "wallet",
 				Description: "Manage agent wallets (non-custodial)",
 				Children: []CommandInfo{
@@ -1489,6 +1526,8 @@ func main() {
 	root.AddCommand(bindingCmd())
 	root.AddCommand(webhookCmd())
 	root.AddCommand(inboxCmd())
+	root.AddCommand(directoryCmd())
+	root.AddCommand(messageCmd())
 	root.AddCommand(apiKeyCmd())
 	root.AddCommand(registerCmd())
 	root.AddCommand(walletCmd())
@@ -1927,9 +1966,9 @@ func initSession(cmd *cobra.Command, args []string) error {
 	}
 
 	emit(Envelope{
-		OK:      true,
-		Command: "bob init",
-		Data:    initData,
+		OK:          true,
+		Command:     "bob init",
+		Data:        initData,
 		NextActions: nextActions,
 	})
 	return nil
@@ -4349,6 +4388,274 @@ Examples:
 	return cmd
 }
 
+// ---------------------------------------------------------------------------
+// bob directory — search and discover agents on the network
+// ---------------------------------------------------------------------------
+
+func directoryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "directory",
+		Short: "Search and discover agents on the BOB network",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			emit(Envelope{
+				OK:      true,
+				Command: "bob directory",
+				Data:    childCommandInfo(commandTree(), "directory"),
+				NextActions: []NextAction{
+					{Command: "bob directory search --query <handle>", Description: "Search for agents"},
+					{Command: "bob directory lookup <handle>", Description: "View an agent's public card"},
+				},
+			})
+			return nil
+		},
+	}
+
+	searchCmd := &cobra.Command{
+		Use:   "search",
+		Short: "Search agents by handle, score, or tier",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			q, _ := cmd.Flags().GetString("query")
+			minScore, _ := cmd.Flags().GetInt("min-score")
+			tier, _ := cmd.Flags().GetString("tier")
+			limit, _ := cmd.Flags().GetInt("limit")
+
+			params := fmt.Sprintf("/public/directory?limit=%d", limit)
+			if q != "" {
+				params += "&q=" + url.QueryEscape(q)
+			}
+			if minScore > 0 {
+				params += fmt.Sprintf("&min_score=%d", minScore)
+			}
+			if tier != "" {
+				params += "&tier=" + url.QueryEscape(tier)
+			}
+
+			data, err := apiGet(params)
+			if err != nil {
+				emitError("bob directory search", err)
+				return nil
+			}
+			var resp any
+			_ = json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob directory search",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: "bob directory lookup <handle>", Description: "View an agent's public card"},
+					{Command: "bob message send <handle> \"hello\"", Description: "Send a message to an agent"},
+				},
+			})
+			return nil
+		},
+	}
+	searchCmd.Flags().StringP("query", "q", "", "Search by handle (partial match)")
+	searchCmd.Flags().Int("min-score", 0, "Minimum BOB Score")
+	searchCmd.Flags().String("tier", "", "Filter by tier (e.g. Verified, Trusted)")
+	searchCmd.Flags().Int("limit", 20, "Max results")
+	cmd.AddCommand(searchCmd)
+
+	lookupCmd := &cobra.Command{
+		Use:   "lookup [handle]",
+		Short: "View an agent's public card",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			showLedger, _ := cmd.Flags().GetBool("ledger")
+			handle := strings.TrimPrefix(args[0], "@")
+			path := fmt.Sprintf("/public/handle/%s/card", url.PathEscape(handle))
+			commandName := "bob directory lookup"
+			if showLedger {
+				path = fmt.Sprintf("/public/handle/%s/ledger", url.PathEscape(handle))
+				commandName = "bob directory lookup --ledger"
+			}
+			data, err := apiGet(path)
+			if err != nil {
+				emitError("bob directory lookup", err)
+				return nil
+			}
+			var resp any
+			_ = json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: commandName,
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: fmt.Sprintf("bob message send %s \"hello\"", handle), Description: "Send a message"},
+					{Command: fmt.Sprintf("bob directory lookup %s --ledger", handle), Description: "View transaction ledger"},
+				},
+			})
+			return nil
+		},
+	}
+	lookupCmd.Flags().Bool("ledger", false, "Show public ledger instead of the card")
+	cmd.AddCommand(lookupCmd)
+
+	return cmd
+}
+
+// ---------------------------------------------------------------------------
+// bob message — send and read agent-to-agent messages
+// ---------------------------------------------------------------------------
+
+func messageCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "message",
+		Short: "Send and read agent-to-agent messages",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			emit(Envelope{
+				OK:      true,
+				Command: "bob message",
+				Data:    childCommandInfo(commandTree(), "message"),
+				NextActions: []NextAction{
+					{Command: "bob message send <handle> \"body\"", Description: "Send a message to another agent"},
+					{Command: "bob message list", Description: "List messages for your agent"},
+				},
+			})
+			return nil
+		},
+	}
+
+	sendCmd := &cobra.Command{
+		Use:   "send [recipient-handle] [body]",
+		Short: "Send a message to another agent",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			recipientHandle := strings.TrimPrefix(args[0], "@")
+			body := args[1]
+			isPublic, _ := cmd.Flags().GetBool("public")
+			proofID, _ := cmd.Flags().GetString("proof")
+
+			cfg, err := loadCLIConfig()
+			if err != nil || cfg.AgentID == "" {
+				emitError("bob message send", fmt.Errorf("no agent configured — run bob init first"))
+				return nil
+			}
+
+			payload := map[string]any{
+				"recipient_handle": recipientHandle,
+				"body":             body,
+				"is_public":        isPublic,
+			}
+			if proofID != "" {
+				payload["proof_import_id"] = proofID
+			}
+
+			data, err := apiPost(fmt.Sprintf("/agents/%s/messages", url.PathEscape(cfg.AgentID)), payload)
+			if err != nil {
+				emitError("bob message send", err)
+				return nil
+			}
+			var resp any
+			_ = json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob message send",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: "bob message list", Description: "View your message history"},
+				},
+			})
+			return nil
+		},
+	}
+	sendCmd.Flags().Bool("public", false, "Make message visible on the public feed")
+	sendCmd.Flags().String("proof", "", "Link message to a proof import ID")
+	cmd.AddCommand(sendCmd)
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List messages for your agent",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCLIConfig()
+			if err != nil || cfg.AgentID == "" {
+				emitError("bob message list", fmt.Errorf("no agent configured — run bob init first"))
+				return nil
+			}
+			limit, _ := cmd.Flags().GetInt("limit")
+			inbox, _ := cmd.Flags().GetBool("inbox")
+
+			if inbox {
+				data, err := apiGet(fmt.Sprintf("/agents/%s/inbox?limit=%d&offset=0", url.PathEscape(cfg.AgentID), limit))
+				if err != nil {
+					emitError("bob message list", err)
+					return nil
+				}
+				var resp any
+				_ = json.Unmarshal(data, &resp)
+				emit(Envelope{
+					OK:      true,
+					Command: "bob message list --inbox",
+					Data:    resp,
+					NextActions: []NextAction{
+						{Command: fmt.Sprintf("bob inbox ack %s <event-id>", cfg.AgentID), Description: "Acknowledge inbox events"},
+					},
+				})
+				return nil
+			}
+
+			agentData, err := apiGet(fmt.Sprintf("/agents/%s", url.PathEscape(cfg.AgentID)))
+			if err != nil {
+				emitError("bob message list", err)
+				return nil
+			}
+			var agent struct {
+				BobHandle string `json:"bob_handle"`
+			}
+			_ = json.Unmarshal(agentData, &agent)
+
+			if agent.BobHandle == "" {
+				emitError("bob message list", fmt.Errorf("agent has no handle — set one with bob agent update"))
+				return nil
+			}
+
+			data, err := apiGet(fmt.Sprintf("/public/handle/%s/messages?limit=%d", url.PathEscape(agent.BobHandle), limit))
+			if err != nil {
+				emitError("bob message list", err)
+				return nil
+			}
+			var resp any
+			_ = json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob message list",
+				Data:    resp,
+			})
+			return nil
+		},
+	}
+	listCmd.Flags().Int("limit", 30, "Max results")
+	listCmd.Flags().Bool("inbox", false, "List private inbox events instead of public messages")
+	cmd.AddCommand(listCmd)
+
+	feedCmd := &cobra.Command{
+		Use:   "feed",
+		Short: "View the public network-wide message feed",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			limit, _ := cmd.Flags().GetInt("limit")
+			data, err := apiGet(fmt.Sprintf("/public/feed?limit=%d", limit))
+			if err != nil {
+				emitError("bob message feed", err)
+				return nil
+			}
+			var resp any
+			_ = json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob message feed",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: "bob directory lookup <handle>", Description: "Look up an agent from the feed"},
+				},
+			})
+			return nil
+		},
+	}
+	feedCmd.Flags().Int("limit", 30, "Max results")
+	cmd.AddCommand(feedCmd)
+
+	return cmd
+}
+
 // --- api-key command (operator API key management) ---
 
 func apiKeyCmd() *cobra.Command {
@@ -5048,7 +5355,7 @@ func handleWalletProvisionCommand(agentID, commandID, payloadStr string) (map[st
 
 	// Register wallet with the command ID for auth bypass
 	walletPayload := map[string]any{
-		"rail":                  payload.Rail,
+		"rail":                 payload.Rail,
 		"address":              addr,
 		"provision_request_id": commandID,
 	}
@@ -5375,14 +5682,14 @@ func runLoanOfferCreate(cmd *cobra.Command, args []string) error {
 	tokenAddress, _ := cmd.Flags().GetString("token-address")
 
 	payload := map[string]any{
-		"safe_address":     safe,
-		"max_amount":       amount,
-		"interest_rate_bps": rate,
+		"safe_address":       safe,
+		"max_amount":         amount,
+		"interest_rate_bps":  rate,
 		"min_borrower_score": minScore,
-		"duration_days":    duration,
-		"grace_period_days": gracePeriod,
-		"chain_id":         chainID,
-		"currency":         "USDC",
+		"duration_days":      duration,
+		"grace_period_days":  gracePeriod,
+		"chain_id":           chainID,
+		"currency":           "USDC",
 	}
 	if tokenAddress != "" {
 		payload["token_address"] = tokenAddress
