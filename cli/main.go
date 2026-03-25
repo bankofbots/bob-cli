@@ -1269,12 +1269,15 @@ func commandTree() CommandInfo {
 				Name:        "loan",
 				Description: "P2P loan marketplace",
 				Children: []CommandInfo{
+					{Name: "lender-status", Description: "Check if your account is approved for lending", Usage: "bob loan lender-status"},
 					{
 						Name:        "offer create",
 						Description: "Create a loan offer",
 						Usage:       "bob loan offer create --agent-id <id> --safe <addr> --amount <usdc> --rate <bps> --min-score <n> --duration <days>",
 					},
 					{Name: "offer list", Description: "List your loan offers", Usage: "bob loan offer list [--agent-id <id>]"},
+					{Name: "offer get", Description: "Get loan offer details", Usage: "bob loan offer get <offer-id>"},
+					{Name: "offer cancel", Description: "Cancel a loan offer", Usage: "bob loan offer cancel <offer-id>"},
 					{Name: "marketplace", Description: "Browse active loan offers", Usage: "bob loan marketplace [--limit <n>]"},
 					{Name: "accept", Description: "Accept a loan offer", Usage: "bob loan accept <offer-id> --amount <usdc> [--agent-id <id>]"},
 					{Name: "draw", Description: "Record a loan drawdown", Usage: "bob loan draw <loan-id> --tx <hash> [--agent-id <id>]"},
@@ -5161,7 +5164,63 @@ func loanCmd() *cobra.Command {
 	offerListCmd.Flags().Int("offset", 0, "Offset")
 	offerCmd.AddCommand(offerListCmd)
 
+	// bob loan offer get
+	offerGetCmd := &cobra.Command{
+		Use:   "get [offer-id]",
+		Short: "Get loan offer details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := apiGet(fmt.Sprintf("/loans/offers/%s", url.PathEscape(args[0])))
+			if err != nil {
+				emitError("bob loan offer get", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{OK: true, Command: "bob loan offer get", Data: resp})
+			return nil
+		},
+	}
+	offerCmd.AddCommand(offerGetCmd)
+
+	// bob loan offer cancel
+	offerCancelCmd := &cobra.Command{
+		Use:   "cancel [offer-id]",
+		Short: "Cancel a loan offer",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := apiDelete(fmt.Sprintf("/loans/offers/%s", url.PathEscape(args[0])))
+			if err != nil {
+				emitError("bob loan offer cancel", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{OK: true, Command: "bob loan offer cancel", Data: resp})
+			return nil
+		},
+	}
+	offerCmd.AddCommand(offerCancelCmd)
+
 	cmd.AddCommand(offerCmd)
+
+	// --- bob loan lender-status ---
+	lenderStatusCmd := &cobra.Command{
+		Use:   "lender-status",
+		Short: "Check if your account is approved for lending",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := apiGet("/loans/lender-status")
+			if err != nil {
+				emitError("bob loan lender-status", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{OK: true, Command: "bob loan lender-status", Data: resp})
+			return nil
+		},
+	}
+	cmd.AddCommand(lenderStatusCmd)
 
 	// --- bob loan marketplace ---
 	marketplaceCmd := &cobra.Command{
