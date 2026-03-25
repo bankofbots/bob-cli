@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.21.0"
+const version = "0.22.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -5701,7 +5701,8 @@ func runLoanOfferCreate(cmd *cobra.Command, args []string) error {
 		payload["token_address"] = tokenAddress
 	}
 
-	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/offers", url.PathEscape(agentID)), payload)
+	payload["agent_id"] = agentID
+	resp, err := apiPost("/loans/offers", payload)
 	if err != nil {
 		emitError("bob loan offer create", err)
 		return nil
@@ -5735,8 +5736,7 @@ func runLoanOfferList(cmd *cobra.Command, args []string) error {
 	limit, _ := cmd.Flags().GetInt("limit")
 	offset, _ := cmd.Flags().GetInt("offset")
 
-	resp, err := apiGet(fmt.Sprintf("/agents/%s/loans/offers?limit=%d&offset=%d",
-		url.PathEscape(agentID), limit, offset))
+	resp, err := apiGet(fmt.Sprintf("/loans/offers?limit=%d&offset=%d", limit, offset))
 	if err != nil {
 		emitError("bob loan offer list", err)
 		return nil
@@ -5853,8 +5853,8 @@ func runLoanDraw(cmd *cobra.Command, args []string) error {
 
 	txHash, _ := cmd.Flags().GetString("tx")
 
-	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/%s/draw",
-		url.PathEscape(agentID), url.PathEscape(loanID)), map[string]any{
+	resp, err := apiPost(fmt.Sprintf("/loans/agreements/%s/draws",
+		url.PathEscape(loanID)), map[string]any{
 		"tx_hash": txHash,
 	})
 	if err != nil {
@@ -5891,8 +5891,8 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 	txHash, _ := cmd.Flags().GetString("tx")
 	amount, _ := cmd.Flags().GetInt64("amount")
 
-	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/%s/repay",
-		url.PathEscape(agentID), url.PathEscape(loanID)), map[string]any{
+	resp, err := apiPost(fmt.Sprintf("/loans/agreements/%s/repayments",
+		url.PathEscape(loanID)), map[string]any{
 		"tx_hash": txHash,
 		"amount":  amount,
 	})
@@ -5929,8 +5929,7 @@ func runLoanList(cmd *cobra.Command, args []string) error {
 	limit, _ := cmd.Flags().GetInt("limit")
 	offset, _ := cmd.Flags().GetInt("offset")
 
-	resp, err := apiGet(fmt.Sprintf("/agents/%s/loans?limit=%d&offset=%d",
-		url.PathEscape(agentID), limit, offset))
+	resp, err := apiGet(fmt.Sprintf("/loans/agreements?limit=%d&offset=%d", limit, offset))
 	if err != nil {
 		emitError("bob loan list", err)
 		return nil
@@ -5966,8 +5965,7 @@ func runLoanStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := apiGet(fmt.Sprintf("/agents/%s/loans/%s",
-		url.PathEscape(agentID), url.PathEscape(loanID)))
+	resp, err := apiGet(fmt.Sprintf("/loans/agreements/%s", url.PathEscape(loanID)))
 	if err != nil {
 		emitError("bob loan status", err)
 		return nil
