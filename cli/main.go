@@ -1233,22 +1233,25 @@ func commandTree() CommandInfo {
 				Description: "Bind an operator wallet as a BOB Score trust signal",
 				Children: []CommandInfo{
 					{
-						Name:        "evm-challenge",
-						Description: "Create an EVM wallet ownership challenge",
-						Usage:       "bob binding evm-challenge --address <0x...>",
+						Name:        "challenge",
+						Description: "Create a wallet ownership challenge for evm, btc, or solana",
+						Usage:       "bob binding challenge --rail <evm|btc|solana> --address <address>",
 						Flags: []FlagInfo{
-							{Name: "address", Type: "string", Required: true, Description: "EVM wallet address (0x...)"},
+							{Name: "rail", Type: "string", Required: true, Description: "Wallet rail (evm, btc, or solana)"},
+							{Name: "address", Type: "string", Required: true, Description: "Wallet address for the selected rail"},
 						},
 					},
 					{
-						Name:        "evm-verify",
-						Description: "Verify EVM wallet ownership challenge with a wallet signature",
-						Usage:       "bob binding evm-verify --challenge-id <id> --address <0x...> --signature <sig> [--chain-id <0x...>]",
+						Name:        "verify",
+						Description: "Verify wallet ownership challenge with a signature",
+						Usage:       "bob binding verify --rail <evm|btc|solana> --challenge-id <id> --address <address> --signature <sig> [--chain-id <0x...>] [--wallet-type <type>]",
 						Flags: []FlagInfo{
-							{Name: "challenge-id", Type: "string", Required: true, Description: "Challenge id from evm-challenge"},
-							{Name: "address", Type: "string", Required: true, Description: "EVM wallet address (0x...)"},
-							{Name: "signature", Type: "string", Required: true, Description: "EIP-191 signature over challenge.message"},
-							{Name: "chain-id", Type: "string", Description: "Optional hex chain id (for example 0x1 or 0x2105)"},
+							{Name: "rail", Type: "string", Required: true, Description: "Wallet rail (evm, btc, or solana)"},
+							{Name: "challenge-id", Type: "string", Required: true, Description: "Challenge id from binding challenge"},
+							{Name: "address", Type: "string", Required: true, Description: "Wallet address for the selected rail"},
+							{Name: "signature", Type: "string", Required: true, Description: "Signature over challenge.message"},
+							{Name: "chain-id", Type: "string", Description: "Optional hex chain id (EVM only)"},
+							{Name: "wallet-type", Type: "string", Description: "Optional wallet type (EVM only, for example coinbase)"},
 						},
 					},
 				},
@@ -4057,37 +4060,12 @@ func bindingCmd() *cobra.Command {
 				Command: "bob binding",
 				Data:    childCommandInfo(commandTree(), "binding"),
 				NextActions: []NextAction{
-					{Command: "bob binding evm-challenge --address <0x...>", Description: "Create an EVM wallet ownership challenge"},
+					{Command: "bob binding challenge --rail evm --address <0x...>", Description: "Create a wallet ownership challenge (evm, btc, or solana)"},
 				},
 			})
 			return nil
 		},
 	}
-
-	evmChallengeCmd := &cobra.Command{
-		Use:   "evm-challenge",
-		Short: "Create an EVM wallet ownership challenge",
-		Args:  cobra.NoArgs,
-		RunE:  operatorEVMBindChallenge,
-	}
-	evmChallengeCmd.Flags().String("address", "", "EVM wallet address (0x...) (required)")
-	evmChallengeCmd.MarkFlagRequired("address")
-	cmd.AddCommand(evmChallengeCmd)
-
-	evmVerifyCmd := &cobra.Command{
-		Use:   "evm-verify",
-		Short: "Verify EVM wallet ownership challenge with a wallet signature",
-		Args:  cobra.NoArgs,
-		RunE:  operatorEVMBindVerify,
-	}
-	evmVerifyCmd.Flags().String("challenge-id", "", "Challenge id from evm-challenge (required)")
-	evmVerifyCmd.Flags().String("address", "", "EVM wallet address (0x...) (required)")
-	evmVerifyCmd.Flags().String("signature", "", "EIP-191 signature over challenge.message (required)")
-	evmVerifyCmd.Flags().String("chain-id", "", "Optional hex chain id (e.g. 0x1 for Ethereum, 0x2105 for Base)")
-	evmVerifyCmd.MarkFlagRequired("challenge-id")
-	evmVerifyCmd.MarkFlagRequired("address")
-	evmVerifyCmd.MarkFlagRequired("signature")
-	cmd.AddCommand(evmVerifyCmd)
 
 	// Generic challenge/verify for any rail (btc, solana, etc.)
 	challengeCmd := &cobra.Command{
@@ -4112,6 +4090,8 @@ func bindingCmd() *cobra.Command {
 	verifyCmd.Flags().String("challenge-id", "", "Challenge id (required)")
 	verifyCmd.Flags().String("address", "", "Wallet address (required)")
 	verifyCmd.Flags().String("signature", "", "Signature over challenge message (required)")
+	verifyCmd.Flags().String("chain-id", "", "Optional hex chain id (EVM only, e.g. 0x1 or 0x2105)")
+	verifyCmd.Flags().String("wallet-type", "", "Optional wallet type for EVM only (e.g. coinbase)")
 	verifyCmd.MarkFlagRequired("rail")
 	verifyCmd.MarkFlagRequired("challenge-id")
 	verifyCmd.MarkFlagRequired("address")
@@ -4120,78 +4100,29 @@ func bindingCmd() *cobra.Command {
 
 	return cmd
 }
-
-// --- EVM wallet binding handlers ---
-
-func operatorEVMBindChallenge(cmd *cobra.Command, args []string) error {
-	address, _ := cmd.Flags().GetString("address")
-	address = strings.TrimSpace(address)
-
-	payload := map[string]any{"address": address}
-	data, err := apiPost("/operators/me/wallet-bindings/evm/challenge", payload)
-	if err != nil {
-		emitErrorWithActions("bob binding evm-challenge", err, []NextAction{
-			{Command: "bob auth me", Description: "Verify operator credentials"},
-		})
-		return nil
-	}
-
-	emit(Envelope{
-		OK:      true,
-		Command: "bob binding evm-challenge",
-		Data:    json.RawMessage(data),
-		NextActions: []NextAction{
-			{Command: "bob binding evm-verify --challenge-id <challenge-id> --address " + address + " --signature <sig>", Description: "Sign challenge.message with your wallet and submit the signature"},
-		},
-	})
-	return nil
-}
-
-func operatorEVMBindVerify(cmd *cobra.Command, args []string) error {
-	challengeID, _ := cmd.Flags().GetString("challenge-id")
-	address, _ := cmd.Flags().GetString("address")
-	signature, _ := cmd.Flags().GetString("signature")
-	chainID, _ := cmd.Flags().GetString("chain-id")
-
-	challengeID = strings.TrimSpace(challengeID)
-	address = strings.TrimSpace(address)
-	signature = strings.TrimSpace(signature)
-	chainID = strings.TrimSpace(chainID)
-
-	payload := map[string]any{
-		"challenge_id": challengeID,
-		"address":      address,
-		"signature":    signature,
-	}
-	if chainID != "" {
-		payload["chain_id"] = chainID
-	}
-
-	data, err := apiPost("/operators/me/wallet-bindings/evm/verify", payload)
-	if err != nil {
-		emitErrorWithActions("bob binding evm-verify", err, []NextAction{
-			{Command: "bob binding evm-challenge --address " + address, Description: "Create a fresh challenge (current one may have expired)"},
-		})
-		return nil
-	}
-
-	emit(Envelope{
-		OK:      true,
-		Command: "bob binding evm-verify",
-		Data:    json.RawMessage(data),
-		NextActions: []NextAction{
-			{Command: "bob score me", Description: "Check updated BOB Score with wallet binding signal"},
-		},
-	})
-	return nil
-}
-
 // --- Generic wallet binding handlers (any rail) ---
 
+func normalizeBindingRail(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "evm":
+		return "evm", nil
+	case "btc", "bitcoin":
+		return "btc", nil
+	case "sol", "solana":
+		return "solana", nil
+	default:
+		return "", fmt.Errorf("rail must be evm, btc, or solana")
+	}
+}
+
 func operatorGenericBindChallenge(cmd *cobra.Command, args []string) error {
-	rail, _ := cmd.Flags().GetString("rail")
+	railRaw, _ := cmd.Flags().GetString("rail")
 	address, _ := cmd.Flags().GetString("address")
-	rail = strings.ToLower(strings.TrimSpace(rail))
+	rail, err := normalizeBindingRail(railRaw)
+	if err != nil {
+		emitError("bob binding challenge", err)
+		return nil
+	}
 	address = strings.TrimSpace(address)
 
 	data, err := apiPost(fmt.Sprintf("/operators/me/wallet-bindings/%s/challenge", url.PathEscape(rail)), map[string]any{
@@ -4216,16 +4147,30 @@ func operatorGenericBindChallenge(cmd *cobra.Command, args []string) error {
 }
 
 func operatorGenericBindVerify(cmd *cobra.Command, args []string) error {
-	rail, _ := cmd.Flags().GetString("rail")
+	railRaw, _ := cmd.Flags().GetString("rail")
 	challengeID, _ := cmd.Flags().GetString("challenge-id")
 	address, _ := cmd.Flags().GetString("address")
 	signature, _ := cmd.Flags().GetString("signature")
-	rail = strings.ToLower(strings.TrimSpace(rail))
+	chainID, _ := cmd.Flags().GetString("chain-id")
+	walletType, _ := cmd.Flags().GetString("wallet-type")
+	rail, err := normalizeBindingRail(railRaw)
+	if err != nil {
+		emitError("bob binding verify", err)
+		return nil
+	}
+	chainID = strings.TrimSpace(chainID)
+	walletType = strings.TrimSpace(strings.ToLower(walletType))
 
 	payload := map[string]any{
 		"challenge_id": strings.TrimSpace(challengeID),
 		"address":      strings.TrimSpace(address),
 		"signature":    strings.TrimSpace(signature),
+	}
+	if chainID != "" && rail == "evm" {
+		payload["chain_id"] = chainID
+	}
+	if walletType != "" && rail == "evm" {
+		payload["wallet_type"] = walletType
 	}
 
 	data, err := apiPost(fmt.Sprintf("/operators/me/wallet-bindings/%s/verify", url.PathEscape(rail)), payload)
@@ -4961,7 +4906,7 @@ func registerWalletBestEffort(agentID, rail, address string) string {
 	}
 	// 403 (no trust signal) is expected before wallet binding — gentle hint
 	if strings.Contains(err.Error(), "403") {
-		return fmt.Sprintf("%s: bind wallet first (bob binding %s-challenge)", rail, rail)
+		return fmt.Sprintf("%s: bind wallet first (bob binding challenge --rail %s --address <addr>)", rail, rail)
 	}
 	return fmt.Sprintf("%s: %s", rail, extractAPIErrorMessage(err))
 }
