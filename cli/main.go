@@ -21,9 +21,9 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.11.0"
+const version = "0.14.0"
 
-const defaultAPIBase = "http://localhost:8080/api/v1"
+const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
 var apiBase = defaultAPIBase
 var apiBaseSource = "default"
