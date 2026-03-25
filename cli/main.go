@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.20.0"
+const version = "0.21.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -5018,6 +5018,27 @@ func resolveAgentID(cmd *cobra.Command) string {
 	return strings.TrimSpace(os.Getenv("BOB_AGENT_ID"))
 }
 
+func resolveEVMWallet() string {
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		return ""
+	}
+	agentID := strings.TrimSpace(cfg.AgentID)
+	if agentID == "" {
+		agentID = strings.TrimSpace(os.Getenv("BOB_AGENT_ID"))
+	}
+	if agentID != "" {
+		if keys, ok := cfg.WalletKeyring[agentID]; ok && keys.EVMAddress != "" {
+			return keys.EVMAddress
+		}
+	}
+	// Legacy flat field.
+	if cfg.EVMAddress != "" {
+		return cfg.EVMAddress
+	}
+	return ""
+}
+
 var noAgentIDActions = []NextAction{
 	{Command: "bob init --code <claim-code>", Description: "Initialize agent session (sets agent_id in config)"},
 	{Command: "export BOB_AGENT_ID=<agent-id>", Description: "Set agent ID via environment variable"},
@@ -5596,6 +5617,7 @@ func loanCmd() *cobra.Command {
 	}
 	acceptCmd.Flags().String("agent-id", "", "Borrower agent ID")
 	acceptCmd.Flags().Int64("amount", 0, "Amount to borrow in USDC (smallest unit)")
+	acceptCmd.Flags().String("wallet", "", "Borrower EVM wallet address (auto-resolved from config if omitted)")
 	_ = acceptCmd.MarkFlagRequired("amount")
 	cmd.AddCommand(acceptCmd)
 
@@ -5783,10 +5805,21 @@ func runLoanAccept(cmd *cobra.Command, args []string) error {
 
 	amount, _ := cmd.Flags().GetInt64("amount")
 
-	resp, err := apiPost(fmt.Sprintf("/agents/%s/loans/accept", url.PathEscape(agentID)), map[string]any{
-		"offer_id": offerID,
+	// Auto-resolve borrower wallet from local config.
+	walletAddr, _ := cmd.Flags().GetString("wallet")
+	if walletAddr == "" {
+		walletAddr = resolveEVMWallet()
+	}
+
+	body := map[string]any{
+		"agent_id": agentID,
 		"amount":   amount,
-	})
+	}
+	if walletAddr != "" {
+		body["borrower_wallet_address"] = walletAddr
+	}
+
+	resp, err := apiPost(fmt.Sprintf("/loans/offers/%s/accept", url.PathEscape(offerID)), body)
 	if err != nil {
 		emitError("bob loan accept", err)
 		return nil
