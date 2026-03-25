@@ -1974,6 +1974,30 @@ func initSession(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// semverLessThan returns true if version a < b using numeric major.minor.patch comparison.
+func semverLessThan(a, b string) bool {
+	parseVer := func(s string) [3]int {
+		s = strings.TrimPrefix(s, "v")
+		parts := strings.SplitN(s, ".", 3)
+		var nums [3]int
+		for i := 0; i < 3 && i < len(parts); i++ {
+			n, _ := strconv.Atoi(parts[i])
+			nums[i] = n
+		}
+		return nums
+	}
+	av, bv := parseVer(a), parseVer(b)
+	for i := 0; i < 3; i++ {
+		if av[i] < bv[i] {
+			return true
+		}
+		if av[i] > bv[i] {
+			return false
+		}
+	}
+	return false
+}
+
 func doctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
@@ -2017,6 +2041,21 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			var parsed map[string]any
 			if err := json.Unmarshal(healthBody, &parsed); err == nil {
 				healthResult["response"] = parsed
+				// Version compatibility check
+				if minCLI, ok := parsed["min_cli_version"].(string); ok && minCLI != "" {
+					apiVer, _ := parsed["api_version"].(string)
+					healthResult["api_version"] = apiVer
+					healthResult["min_cli_version"] = minCLI
+					if semverLessThan(version, minCLI) {
+						warnings = append(warnings, fmt.Sprintf(
+							"CLI v%s — API requires v%s+. Download latest: https://github.com/bankofbots/bob-agent-kit/releases/latest",
+							version, minCLI,
+						))
+						healthResult["version_compatible"] = false
+					} else {
+						healthResult["version_compatible"] = true
+					}
+				}
 			} else {
 				healthResult["response"] = string(healthBody)
 			}
