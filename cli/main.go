@@ -54,19 +54,70 @@ func init() {
 	}
 }
 
-type cliConfig struct {
-	APIURL   string `json:"api_url,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	APIKey   string `json:"api_key,omitempty"`
-	AgentID  string `json:"agent_id,omitempty"`
-
-	// Wallet keys (generated during bob init, stored locally — never sent to BOB)
+// agentWalletKeys stores wallet private keys for a single agent.
+// Keys are generated once per agent and never overwritten — even if the
+// active agent changes, old keys remain recoverable in WalletKeyring.
+type agentWalletKeys struct {
 	EVMPrivateKey string `json:"evm_private_key,omitempty"`
 	EVMAddress    string `json:"evm_address,omitempty"`
 	BTCPrivateKey string `json:"btc_private_key,omitempty"`
 	BTCAddress    string `json:"btc_address,omitempty"`
 	SOLPrivateKey string `json:"sol_private_key,omitempty"`
 	SOLAddress    string `json:"sol_address,omitempty"`
+}
+
+type cliConfig struct {
+	APIURL   string `json:"api_url,omitempty"`
+	Platform string `json:"platform,omitempty"`
+	APIKey   string `json:"api_key,omitempty"`
+	AgentID  string `json:"agent_id,omitempty"`
+
+	// Per-agent wallet keyring — keyed by agent ID.
+	// Every agent that ever ran `bob init` on this machine has its keys here.
+	WalletKeyring map[string]agentWalletKeys `json:"wallet_keyring,omitempty"`
+
+	// Legacy flat fields — migrated to WalletKeyring on first load.
+	EVMPrivateKey string `json:"evm_private_key,omitempty"`
+	EVMAddress    string `json:"evm_address,omitempty"`
+	BTCPrivateKey string `json:"btc_private_key,omitempty"`
+	BTCAddress    string `json:"btc_address,omitempty"`
+	SOLPrivateKey string `json:"sol_private_key,omitempty"`
+	SOLAddress    string `json:"sol_address,omitempty"`
+}
+
+// migrateWalletKeyring moves legacy flat wallet keys into the per-agent keyring.
+func (c *cliConfig) migrateWalletKeyring() {
+	if c.EVMAddress == "" {
+		return
+	}
+	if c.WalletKeyring == nil {
+		c.WalletKeyring = make(map[string]agentWalletKeys)
+	}
+	agentID := c.AgentID
+	if agentID == "" {
+		agentID = "_unknown"
+		fmt.Fprintf(os.Stderr, "warning: migrating wallet keys with no agent_id — storing under '_unknown' bucket. Run 'bob init' to associate with an agent.\n")
+	}
+	if _, exists := c.WalletKeyring[agentID]; exists {
+		return
+	}
+	c.WalletKeyring[agentID] = agentWalletKeys{
+		EVMPrivateKey: c.EVMPrivateKey, EVMAddress: c.EVMAddress,
+		BTCPrivateKey: c.BTCPrivateKey, BTCAddress: c.BTCAddress,
+		SOLPrivateKey: c.SOLPrivateKey, SOLAddress: c.SOLAddress,
+	}
+}
+
+// activeWalletKeys returns the wallet keys for the current agent, or nil.
+func (c *cliConfig) activeWalletKeys() *agentWalletKeys {
+	if c.WalletKeyring == nil {
+		return nil
+	}
+	keys, ok := c.WalletKeyring[c.AgentID]
+	if !ok {
+		return nil
+	}
+	return &keys
 }
 
 func validPlatform(raw string) bool {
@@ -128,6 +179,7 @@ func loadCLIConfig() (cliConfig, error) {
 		if err := json.Unmarshal(b, &cfg); err != nil {
 			return cliConfig{}, err
 		}
+		cfg.migrateWalletKeyring()
 		return cfg, nil
 	}
 	return cliConfig{}, nil
@@ -4470,21 +4522,24 @@ type walletInitResult struct {
 }
 
 func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
-	// Check if keys already exist in config
 	cfg, loadErr := loadCLIConfig()
-	if loadErr == nil && cfg.EVMAddress != "" {
-		// Already generated — re-register (idempotent, server returns 409 on dup)
-		registerWalletBestEffort(agentID, "evm", cfg.EVMAddress)
-		registerWalletBestEffort(agentID, "btc", cfg.BTCAddress)
-		registerWalletBestEffort(agentID, "solana", cfg.SOLAddress)
-		return walletInitResult{
-			evmAddress: cfg.EVMAddress,
-			btcAddress: cfg.BTCAddress,
-			solAddress: cfg.SOLAddress,
+
+	// If this agent already has keys in the keyring, reuse them.
+	if loadErr == nil {
+		if existing := cfg.activeWalletKeys(); existing != nil && existing.EVMAddress != "" && cfg.AgentID == agentID {
+			registerWalletBestEffort(agentID, "evm", existing.EVMAddress)
+			registerWalletBestEffort(agentID, "btc", existing.BTCAddress)
+			registerWalletBestEffort(agentID, "solana", existing.SOLAddress)
+			return walletInitResult{
+				evmAddress: existing.EVMAddress,
+				btcAddress: existing.BTCAddress,
+				solAddress: existing.SOLAddress,
+			}
 		}
 	}
 
-	// Detect BTC network from API URL: localhost → regtest, testnet → testnet, else mainnet.
+	// New agent or first init — generate fresh keys.
+	// Old agent keys stay in the keyring and are never lost.
 	btcHRP := "bc"
 	loweredBase := strings.ToLower(apiBase)
 	if strings.Contains(loweredBase, "localhost") || strings.Contains(loweredBase, "127.0.0.1") {
@@ -4498,8 +4553,17 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		return walletInitResult{err: "wallet: keygen failed: " + err.Error()}
 	}
 
-	// Persist private keys to config (never leaves the machine)
+	// Persist to per-agent keyring. Old agent keys are preserved.
 	if loadErr == nil {
+		if cfg.WalletKeyring == nil {
+			cfg.WalletKeyring = make(map[string]agentWalletKeys)
+		}
+		cfg.WalletKeyring[agentID] = agentWalletKeys{
+			EVMPrivateKey: keys.EVMPrivateKey, EVMAddress: keys.EVMAddress,
+			BTCPrivateKey: keys.BTCPrivateKey, BTCAddress: keys.BTCAddress,
+			SOLPrivateKey: keys.SOLPrivateKey, SOLAddress: keys.SOLAddress,
+		}
+		// Also update legacy flat fields for backwards compat with older CLIs.
 		cfg.EVMPrivateKey = keys.EVMPrivateKey
 		cfg.EVMAddress = keys.EVMAddress
 		cfg.BTCPrivateKey = keys.BTCPrivateKey
@@ -4511,7 +4575,7 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		}
 	}
 
-	// Register addresses with BOB (best-effort — 409 is fine, 403 means no trust signal yet)
+	// Register with BOB (best-effort — 409 is fine, 403 means no trust signal yet)
 	var regWarnings []string
 	for _, entry := range []struct{ rail, addr string }{
 		{"evm", keys.EVMAddress},
