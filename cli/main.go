@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.33.0"
+const version = "0.34.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1562,6 +1562,7 @@ func initCmd() *cobra.Command {
 	}
 	cmd.Flags().String("token", "", "One-time setup token (`bos_...`) to exchange for API key")
 	cmd.Flags().String("code", "", "One-time claim code (`BOB-XXXX-XXXX`) to redeem for API key")
+	cmd.Flags().String("name", "", "Agent name — what your operator calls you (seeds your public handle)")
 	cmd.Flags().String("agent-id", "", "Agent ID (required if --token is not provided)")
 	cmd.Flags().String("api-key", "", "Agent API key (required if --token is not provided)")
 	cmd.Flags().String("platform", defaultPlatform, "Output style hint (generic, openclaw, claude)")
@@ -1725,13 +1726,15 @@ func registerAgent(cmd *cobra.Command, args []string) error {
 func initSession(cmd *cobra.Command, args []string) error {
 	token, _ := cmd.Flags().GetString("token")
 	claimCode, _ := cmd.Flags().GetString("code")
+	nameFlag, _ := cmd.Flags().GetString("name")
 	agentID, _ := cmd.Flags().GetString("agent-id")
 	initAPIKey, _ := cmd.Flags().GetString("api-key")
 	platform, _ := cmd.Flags().GetString("platform")
 	apiURLFlag, _ := cmd.Flags().GetString("api-url")
 	showAPIKey, _ := cmd.Flags().GetBool("show-api-key")
 
-	var agentName string // populated from claim-code redeem or auth/me
+	var agentName string  // populated from claim-code redeem or auth/me
+	var bobHandle string  // populated from claim-code redeem
 	platform = strings.ToLower(strings.TrimSpace(platform))
 	if platform == "" {
 		platform = "generic"
@@ -1806,10 +1809,14 @@ func initSession(cmd *cobra.Command, args []string) error {
 		apiBase = normalizedAPIBase
 		defer func() { apiBase = previousBase }()
 
-		resp, err := apiPostNoAuth("/claim-code/redeem", map[string]any{
+		redeemPayload := map[string]any{
 			"code":     claimCode,
 			"platform": platform,
-		})
+		}
+		if trimmedName := strings.TrimSpace(nameFlag); trimmedName != "" {
+			redeemPayload["name"] = trimmedName
+		}
+		resp, err := apiPostNoAuth("/claim-code/redeem", redeemPayload)
 		if err != nil {
 			parsedErr := extractAPIErrorMessage(err)
 			if strings.Contains(strings.ToLower(parsedErr), "invalid or expired claim code") {
@@ -1826,11 +1833,13 @@ func initSession(cmd *cobra.Command, args []string) error {
 			APIKey    string `json:"api_key"`
 			AgentID   string `json:"agent_id"`
 			AgentName string `json:"agent_name"`
+			BobHandle string `json:"bob_handle"`
 			APIURL    string `json:"api_url"`
 			Data      struct {
 				APIKey    string `json:"api_key"`
 				AgentID   string `json:"agent_id"`
 				AgentName string `json:"agent_name"`
+				BobHandle string `json:"bob_handle"`
 				APIURL    string `json:"api_url"`
 			} `json:"data"`
 		}
@@ -1861,13 +1870,20 @@ func initSession(cmd *cobra.Command, args []string) error {
 		initAPIKey = resolvedAPIKey
 		agentID = resolvedAgentID
 
-		// Surface agent name from redeem response
+		// Surface agent name and handle from redeem response
 		resolvedName := strings.TrimSpace(redeemResp.AgentName)
 		if resolvedName == "" {
 			resolvedName = strings.TrimSpace(redeemResp.Data.AgentName)
 		}
 		if resolvedName != "" {
 			agentName = resolvedName
+		}
+		resolvedHandle := strings.TrimSpace(redeemResp.BobHandle)
+		if resolvedHandle == "" {
+			resolvedHandle = strings.TrimSpace(redeemResp.Data.BobHandle)
+		}
+		if resolvedHandle != "" {
+			bobHandle = resolvedHandle
 		}
 	}
 
@@ -1980,6 +1996,7 @@ func initSession(cmd *cobra.Command, args []string) error {
 		"initialized_as":   fmt.Sprintf("platform=%s", platform),
 		"agent_id":         agentID,
 		"agent_name":       agentName,
+		"bob_handle":       bobHandle,
 		"api_key_redacted": redactKey(initAPIKey),
 		"api_key_hidden":   !shouldPrintAPIKey,
 		"api_url":          normalizedAPIBase,
@@ -2556,7 +2573,90 @@ Example:
 	}
 	cmd.AddCommand(passportGetCmd)
 
+	// profile — subgroup for profile commands
+	profileCmd := &cobra.Command{
+		Use:   "profile",
+		Short: "Manage agent profile",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			emit(Envelope{
+				OK:      true,
+				Command: "bob agent profile",
+				NextActions: []NextAction{
+					{Command: "bob agent profile set --name <name>", Description: "Set your agent display name and handle"},
+				},
+			})
+			return nil
+		},
+	}
+	profileSetCmd := &cobra.Command{
+		Use:   "set",
+		Short: "Update agent profile (name, handle, description)",
+		RunE:  agentProfileSet,
+	}
+	profileSetCmd.Flags().String("name", "", "Agent display name (seeds public handle)")
+	profileSetCmd.Flags().String("bob-handle", "", "Public handle (lowercase, alphanumeric + hyphen/underscore/dot)")
+	profileSetCmd.Flags().String("description", "", "Agent description")
+	profileSetCmd.Flags().String("agent-id", "", "Agent ID (default: $BOB_AGENT_ID or config)")
+	profileCmd.AddCommand(profileSetCmd)
+	cmd.AddCommand(profileCmd)
+
 	return cmd
+}
+
+func agentProfileSet(cmd *cobra.Command, args []string) error {
+	name, _ := cmd.Flags().GetString("name")
+	handle, _ := cmd.Flags().GetString("bob-handle")
+	description, _ := cmd.Flags().GetString("description")
+
+	name = strings.TrimSpace(name)
+	handle = strings.TrimSpace(handle)
+	description = strings.TrimSpace(description)
+
+	if name == "" && handle == "" && description == "" {
+		emitError("bob agent profile set", fmt.Errorf("provide at least one of --name, --bob-handle, or --description"))
+		return nil
+	}
+
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitError("bob agent profile set", fmt.Errorf("could not determine agent ID — set BOB_AGENT_ID or pass --agent-id"))
+		return nil
+	}
+
+	payload := map[string]any{}
+	if name != "" {
+		payload["name"] = name
+		// Also set bob_handle from name if user didn't explicitly provide one.
+		if handle == "" {
+			payload["bob_handle"] = name
+		}
+	}
+	if handle != "" {
+		payload["bob_handle"] = handle
+	}
+	if description != "" {
+		payload["description"] = description
+	}
+
+	data, err := apiPatch(fmt.Sprintf("/agents/%s/profile", agentID), payload)
+	if err != nil {
+		emitError("bob agent profile set", err)
+		return nil
+	}
+
+	var resp any
+	json.Unmarshal(data, &resp)
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob agent profile set",
+		Data:    resp,
+		NextActions: []NextAction{
+			{Command: fmt.Sprintf("bob agent get %s", agentID), Description: "View updated agent details"},
+			{Command: "bob score me", Description: "Check your BOB Score"},
+		},
+	})
+	return nil
 }
 
 func agentCredit(cmd *cobra.Command, args []string) error {
@@ -6218,3 +6318,4 @@ func runLoanRequestCancel(cmd *cobra.Command, args []string) error {
 	})
 	return nil
 }
+
