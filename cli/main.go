@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.32.0"
+const version = "0.33.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1731,6 +1731,7 @@ func initSession(cmd *cobra.Command, args []string) error {
 	apiURLFlag, _ := cmd.Flags().GetString("api-url")
 	showAPIKey, _ := cmd.Flags().GetBool("show-api-key")
 
+	var agentName string // populated from claim-code redeem or auth/me
 	platform = strings.ToLower(strings.TrimSpace(platform))
 	if platform == "" {
 		platform = "generic"
@@ -1822,13 +1823,15 @@ func initSession(cmd *cobra.Command, args []string) error {
 		}
 
 		var redeemResp struct {
-			APIKey  string `json:"api_key"`
-			AgentID string `json:"agent_id"`
-			APIURL  string `json:"api_url"`
-			Data    struct {
-				APIKey  string `json:"api_key"`
-				AgentID string `json:"agent_id"`
-				APIURL  string `json:"api_url"`
+			APIKey    string `json:"api_key"`
+			AgentID   string `json:"agent_id"`
+			AgentName string `json:"agent_name"`
+			APIURL    string `json:"api_url"`
+			Data      struct {
+				APIKey    string `json:"api_key"`
+				AgentID   string `json:"agent_id"`
+				AgentName string `json:"agent_name"`
+				APIURL    string `json:"api_url"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(resp, &redeemResp); err != nil {
@@ -1857,6 +1860,15 @@ func initSession(cmd *cobra.Command, args []string) error {
 		}
 		initAPIKey = resolvedAPIKey
 		agentID = resolvedAgentID
+
+		// Surface agent name from redeem response
+		resolvedName := strings.TrimSpace(redeemResp.AgentName)
+		if resolvedName == "" {
+			resolvedName = strings.TrimSpace(redeemResp.Data.AgentName)
+		}
+		if resolvedName != "" {
+			agentName = resolvedName
+		}
 	}
 
 	agentID = strings.TrimSpace(agentID)
@@ -1967,6 +1979,7 @@ func initSession(cmd *cobra.Command, args []string) error {
 		"platform":         platform,
 		"initialized_as":   fmt.Sprintf("platform=%s", platform),
 		"agent_id":         agentID,
+		"agent_name":       agentName,
 		"api_key_redacted": redactKey(initAPIKey),
 		"api_key_hidden":   !shouldPrintAPIKey,
 		"api_url":          normalizedAPIBase,
