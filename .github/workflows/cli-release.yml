@@ -67,7 +67,16 @@ jobs:
             echo "ASSET_PATH=dist/${ARTIFACT_BASENAME}.tar.gz" >> "$GITHUB_ENV"
           fi
 
-      - name: Upload release asset
+      - name: Generate SHA256 checksum
+        run: |
+          sha256sum "$ASSET_PATH" > "$ASSET_PATH.sha256"
+          echo "CHECKSUM_PATH=$ASSET_PATH.sha256" >> "$GITHUB_ENV"
+        env:
+          ASSET_PATH: ${{ env.ASSET_PATH }}
+
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET_PATH }}
+          files: |
+            ${{ env.ASSET_PATH }}
+            ${{ env.CHECKSUM_PATH }}
