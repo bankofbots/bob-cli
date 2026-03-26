@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.25.0"
+const version = "0.26.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -5509,11 +5509,12 @@ func loanCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 
-	// bob loan offer create
+	// bob loan offer create (deprecated — use dashboard for lender offers)
 	offerCreateCmd := &cobra.Command{
-		Use:   "create",
-		Short: "Create a loan offer",
-		RunE:  runLoanOfferCreate,
+		Use:        "create",
+		Short:      "[Deprecated] Use bob loan request to apply as a borrower",
+		Deprecated: "lender offers are managed via the dashboard. Use `bob loan request` to apply for a loan.",
+		RunE:       runLoanOfferCreate,
 	}
 	offerCreateCmd.Flags().String("agent-id", "", "Lender agent ID")
 	offerCreateCmd.Flags().String("safe", "", "Safe/wallet address for funding")
@@ -5617,7 +5618,7 @@ func loanCmd() *cobra.Command {
 		RunE:  runLoanAccept,
 	}
 	acceptCmd.Flags().String("agent-id", "", "Borrower agent ID")
-	acceptCmd.Flags().Int64("amount", 0, "Amount to borrow in USDC (smallest unit)")
+	acceptCmd.Flags().Int64("amount", 0, "Amount in USDC micro-units (e.g. 5000000 = $5.00)")
 	acceptCmd.Flags().String("wallet", "", "Borrower EVM wallet address (auto-resolved from config if omitted)")
 	_ = acceptCmd.MarkFlagRequired("amount")
 	cmd.AddCommand(acceptCmd)
@@ -5708,61 +5709,52 @@ func loanCmd() *cobra.Command {
 	acceptTermsCmd.Flags().String("agent-id", "", "Agent ID")
 	cmd.AddCommand(acceptTermsCmd)
 
+	// --- bob loan request ---
+	requestCmd := &cobra.Command{
+		Use:   "request",
+		Short: "Request a loan (borrower)",
+		Long:  "Submit a loan request as a borrower. An admin will review and fund it.",
+		RunE:  runLoanRequest,
+	}
+	requestCmd.Flags().String("agent-id", "", "Agent ID")
+	requestCmd.Flags().Int64("amount", 0, "Amount in USDC micro-units (e.g. 5000000 = $5.00)")
+	requestCmd.Flags().Int("max-rate", 0, "Maximum interest rate in basis points (0 = any)")
+	requestCmd.Flags().Int("duration", 30, "Loan duration in days")
+	requestCmd.Flags().String("purpose", "", "Purpose of the loan (optional)")
+	_ = requestCmd.MarkFlagRequired("amount")
+	cmd.AddCommand(requestCmd)
+
+	// --- bob loan requests ---
+	requestsCmd := &cobra.Command{
+		Use:   "requests",
+		Short: "List your loan requests",
+		RunE:  runLoanRequests,
+	}
+	requestsCmd.Flags().String("agent-id", "", "Agent ID")
+	requestsCmd.Flags().Int("limit", 30, "Max results")
+	cmd.AddCommand(requestsCmd)
+
+	// --- bob loan request-cancel ---
+	requestCancelCmd := &cobra.Command{
+		Use:   "request-cancel [request-id]",
+		Short: "Cancel a pending loan request",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runLoanRequestCancel,
+	}
+	requestCancelCmd.Flags().String("agent-id", "", "Agent ID")
+	cmd.AddCommand(requestCancelCmd)
+
 	return cmd
 }
 
 func runLoanOfferCreate(cmd *cobra.Command, args []string) error {
-	agentID := resolveAgentID(cmd)
-	if agentID == "" {
-		emitErrorWithActions("bob loan offer create", fmt.Errorf("no agent ID"), noAgentIDActions)
-		return nil
-	}
-
-	safe, _ := cmd.Flags().GetString("safe")
-	amount, _ := cmd.Flags().GetInt64("amount")
-	rate, _ := cmd.Flags().GetInt("rate")
-	minScore, _ := cmd.Flags().GetInt("min-score")
-	duration, _ := cmd.Flags().GetInt("duration")
-	gracePeriod, _ := cmd.Flags().GetInt("grace-period")
-	chainID, _ := cmd.Flags().GetString("chain-id")
-	tokenAddress, _ := cmd.Flags().GetString("token-address")
-
-	payload := map[string]any{
-		"safe_address":       safe,
-		"max_amount":         amount,
-		"interest_rate_bps":  rate,
-		"min_borrower_score": minScore,
-		"duration_days":      duration,
-		"grace_period_days":  gracePeriod,
-		"chain_id":           chainID,
-		"currency":           "USDC",
-	}
-	if tokenAddress != "" {
-		payload["token_address"] = tokenAddress
-	}
-
-	payload["agent_id"] = agentID
-	resp, err := apiPost("/loans/offers", payload)
-	if err != nil {
-		emitError("bob loan offer create", err)
-		return nil
-	}
-
-	var offer json.RawMessage
-	if err := json.Unmarshal(resp, &offer); err != nil {
-		emitError("bob loan offer create", fmt.Errorf("failed to parse response: %w", err))
-		return nil
-	}
-
-	emit(Envelope{
-		OK:      true,
-		Command: "bob loan offer create",
-		Data:    offer,
-		NextActions: []NextAction{
-			{Command: "bob loan offer list --agent-id " + agentID, Description: "List your loan offers"},
-			{Command: "bob loan marketplace", Description: "Browse all active offers"},
-		},
-	})
+	emitErrorWithActions("bob loan offer create",
+		fmt.Errorf("creating lender offers is not available via CLI — use `bob loan request` to apply for a loan as a borrower"),
+		[]NextAction{
+			{Command: "bob loan request --amount <usdc> --duration 30", Description: "Request a loan as a borrower"},
+			{Command: "bob loan eligibility", Description: "Check if you qualify for a loan"},
+			{Command: "bob loan marketplace", Description: "Browse active offers"},
+		})
 	return nil
 }
 
@@ -6093,6 +6085,112 @@ func runLoanAcceptTerms(cmd *cobra.Command, args []string) error {
 		NextActions: []NextAction{
 			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check loan status"},
 			{Command: "bob loan draw " + loanID + " --tx <hash> --agent-id " + agentID, Description: "Record funding draw"},
+		},
+	})
+	return nil
+}
+
+func runLoanRequest(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan request", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	amount, _ := cmd.Flags().GetInt64("amount")
+	maxRate, _ := cmd.Flags().GetInt("max-rate")
+	duration, _ := cmd.Flags().GetInt("duration")
+	purpose, _ := cmd.Flags().GetString("purpose")
+
+	body := map[string]any{
+		"agent_id":      agentID,
+		"amount":        amount,
+		"duration_days": duration,
+	}
+	if maxRate > 0 {
+		body["max_interest_rate_bps"] = maxRate
+	}
+	if purpose != "" {
+		body["purpose"] = purpose
+	}
+
+	resp, err := apiPost("/loans/requests", body)
+	if err != nil {
+		emitError("bob loan request", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob loan request", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan request",
+		Data:    result,
+		NextActions: []NextAction{
+			{Command: "bob loan requests", Description: "List your loan requests"},
+			{Command: "bob loan eligibility", Description: "Check your eligibility"},
+		},
+	})
+	return nil
+}
+
+func runLoanRequests(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan requests", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	limit, _ := cmd.Flags().GetInt("limit")
+
+	resp, err := apiGet(fmt.Sprintf("/loans/requests?limit=%d", limit))
+	if err != nil {
+		emitError("bob loan requests", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob loan requests", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan requests",
+		Data:    result,
+		NextActions: []NextAction{
+			{Command: "bob loan request --amount <usdc> --duration 30", Description: "Submit a new request"},
+		},
+	})
+	return nil
+}
+
+func runLoanRequestCancel(cmd *cobra.Command, args []string) error {
+	requestID := args[0]
+
+	resp, err := apiDelete(fmt.Sprintf("/loans/requests/%s", url.PathEscape(requestID)))
+	if err != nil {
+		emitError("bob loan request-cancel", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob loan request-cancel", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan request-cancel",
+		Data:    result,
+		NextActions: []NextAction{
+			{Command: "bob loan requests", Description: "List remaining requests"},
 		},
 	})
 	return nil
