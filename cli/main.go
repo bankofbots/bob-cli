@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.28.0"
+const version = "0.29.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1535,6 +1535,7 @@ func main() {
 	root.AddCommand(registerCmd())
 	root.AddCommand(walletCmd())
 	root.AddCommand(loanCmd())
+	root.AddCommand(updateCmd())
 
 	if err := root.Execute(); err != nil {
 		emitError("bob", err)
