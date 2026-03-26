@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.31.0"
+const version = "0.32.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1661,6 +1661,7 @@ func registerAgent(cmd *cobra.Command, args []string) error {
 	var reg struct {
 		AgentID     string `json:"agent_id"`
 		APIKey      string `json:"api_key"`
+		BobHandle   string `json:"bob_handle"`
 		OperatorID  string `json:"operator_id"`
 		Status      string `json:"status"`
 		Message     string `json:"message"`
@@ -1702,6 +1703,7 @@ func registerAgent(cmd *cobra.Command, args []string) error {
 	data := map[string]any{
 		"agent_id":    reg.AgentID,
 		"api_key":     reg.APIKey,
+		"bob_handle":  reg.BobHandle,
 		"operator_id": reg.OperatorID,
 		"status":      reg.Status,
 		"message":     reg.Message,
