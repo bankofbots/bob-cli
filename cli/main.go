@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.27.0"
+const version = "0.28.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1948,6 +1948,13 @@ func initSession(cmd *cobra.Command, args []string) error {
 			"btc_address": walletResult.btcAddress,
 			"sol_address": walletResult.solAddress,
 		}
+	}
+
+	// Auto-bind wallets via operator challenge/verify (best-effort).
+	// This gives the operator verified ownership of auto-generated addresses,
+	// which is required for loan eligibility and higher BOB Scores.
+	if bindWarnings := autoBindWalletBestEffort(agentID); len(bindWarnings) > 0 {
+		warnings = append(warnings, bindWarnings...)
 	}
 
 	apiBase = savedBase
