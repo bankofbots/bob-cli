@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.24.0"
+const version = "0.25.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1376,6 +1376,7 @@ func commandTree() CommandInfo {
 					{Name: "repay", Description: "Record a loan repayment", Usage: "bob loan repay <loan-id> --tx <hash> --amount <usdc> [--agent-id <id>]"},
 					{Name: "list", Description: "List your loans", Usage: "bob loan list [--agent-id <id>]"},
 					{Name: "status", Description: "Show loan status", Usage: "bob loan status <loan-id> [--agent-id <id>]"},
+					{Name: "accept-terms", Description: "Sign and accept loan terms", Usage: "bob loan accept-terms [loan-id] [--agent-id <id>]"},
 				},
 			},
 			{
@@ -5696,6 +5697,17 @@ func loanCmd() *cobra.Command {
 	}
 	cmd.AddCommand(eligibilityCmd)
 
+	// --- bob loan accept-terms ---
+	acceptTermsCmd := &cobra.Command{
+		Use:   "accept-terms [loan-id]",
+		Short: "Accept loan terms and sign the agreement",
+		Long:  "Sign and accept the loan terms for a pending_terms loan. If no loan-id is provided, automatically finds your pending loan.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE:  runLoanAcceptTerms,
+	}
+	acceptTermsCmd.Flags().String("agent-id", "", "Agent ID")
+	cmd.AddCommand(acceptTermsCmd)
+
 	return cmd
 }
 
@@ -6012,6 +6024,75 @@ func runLoanStatus(cmd *cobra.Command, args []string) error {
 		NextActions: []NextAction{
 			{Command: "bob loan repay " + loanID + " --tx <hash> --amount <usdc> --agent-id " + agentID, Description: "Record a repayment"},
 			{Command: "bob loan list --agent-id " + agentID, Description: "List all loans"},
+		},
+	})
+	return nil
+}
+
+func runLoanAcceptTerms(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob loan accept-terms", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	var loanID string
+	if len(args) > 0 {
+		loanID = args[0]
+	} else {
+		// Auto-find the first pending_terms loan for this agent.
+		resp, err := apiGet("/loans/agreements")
+		if err != nil {
+			emitError("bob loan accept-terms", err)
+			return nil
+		}
+		var loans []map[string]any
+		if err := json.Unmarshal(resp, &loans); err != nil {
+			emitError("bob loan accept-terms", fmt.Errorf("failed to parse loans: %w", err))
+			return nil
+		}
+		for _, l := range loans {
+			status, _ := l["status"].(string)
+			borrower, _ := l["borrower_agent_id"].(string)
+			if status == "pending_terms" && borrower == agentID {
+				if id, ok := l["id"].(string); ok {
+					loanID = id
+					break
+				}
+			}
+		}
+		if loanID == "" {
+			emitErrorWithActions("bob loan accept-terms", fmt.Errorf("no pending_terms loan found for agent %s", agentID), []NextAction{
+				{Command: "bob loan list --agent-id " + agentID, Description: "List your loans to check status"},
+				{Command: "bob loan request --amount <usdc> --duration 30", Description: "Request a new loan"},
+			})
+			return nil
+		}
+	}
+
+	resp, err := apiPost(fmt.Sprintf("/loans/agreements/%s/accept-terms", url.PathEscape(loanID)), map[string]any{})
+	if err != nil {
+		emitError("bob loan accept-terms", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob loan accept-terms", fmt.Errorf("failed to parse response: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob loan accept-terms",
+		Data: map[string]any{
+			"loan_id": loanID,
+			"result":  result,
+			"message": "Loan terms accepted. Agent signature recorded.",
+		},
+		NextActions: []NextAction{
+			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check loan status"},
+			{Command: "bob loan draw " + loanID + " --tx <hash> --agent-id " + agentID, Description: "Record funding draw"},
 		},
 	})
 	return nil
