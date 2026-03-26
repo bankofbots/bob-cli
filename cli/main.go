@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.23.0"
+const version = "0.24.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1501,7 +1501,6 @@ func main() {
 						"name": {Required: true, Description: "Agent name"},
 					}},
 					{Command: "bob score me", Description: "View your BOB Score"},
-					{Command: "bob score me", Description: "View your BOB Score"},
 				},
 			})
 			return nil
@@ -2289,6 +2288,7 @@ func agentCmd() *cobra.Command {
 		Short:      "[REMOVED] Use 'bob score me' instead",
 		Args:       cobra.ExactArgs(1),
 		Deprecated: "use 'bob score me' instead",
+		Hidden:     true,
 		RunE:       agentCredit,
 	})
 
@@ -5474,7 +5474,7 @@ func loanCmd() *cobra.Command {
 				OK:      true,
 				Command: "bob loan",
 				Data: map[string]any{
-					"subcommands": []string{"offer", "marketplace", "accept", "draw", "repay", "list", "status"},
+					"subcommands": []string{"offer", "marketplace", "accept", "draw", "repay", "list", "status", "eligibility"},
 				},
 				NextActions: []NextAction{
 					{Command: "bob loan marketplace", Description: "Browse active loan offers"},
@@ -5667,6 +5667,34 @@ func loanCmd() *cobra.Command {
 	}
 	statusCmd.Flags().String("agent-id", "", "Agent ID")
 	cmd.AddCommand(statusCmd)
+
+	// --- bob loan eligibility ---
+	eligibilityCmd := &cobra.Command{
+		Use:   "eligibility",
+		Short: "Check if you qualify for a loan",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := apiGet("/loans/eligibility")
+			if err != nil {
+				emitError("bob loan eligibility", err)
+				return nil
+			}
+			var resp any
+			json.Unmarshal(data, &resp)
+			emit(Envelope{
+				OK:      true,
+				Command: "bob loan eligibility",
+				Data:    resp,
+				NextActions: []NextAction{
+					{Command: "bob loan marketplace", Description: "Browse active loan offers"},
+					{Command: "bob score me", Description: "Check your BOB Score"},
+				},
+			})
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	cmd.AddCommand(eligibilityCmd)
 
 	return cmd
 }
