@@ -21,7 +21,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.40.0"
+const version = "0.41.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -4940,8 +4940,8 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 	cfg, loadErr := loadCLIConfig()
 
 	// If this agent already has keys in the keyring, reuse them.
-	if loadErr == nil {
-		if existing := cfg.activeWalletKeys(); existing != nil && existing.EVMAddress != "" && cfg.AgentID == agentID {
+	if loadErr == nil && cfg.AgentID == agentID {
+		if existing := cfg.activeWalletKeys(); existing != nil && existing.EVMAddress != "" {
 			registerWalletBestEffort(agentID, "evm", existing.EVMAddress)
 			registerWalletBestEffort(agentID, "btc", existing.BTCAddress)
 			registerWalletBestEffort(agentID, "solana", existing.SOLAddress)
@@ -4950,6 +4950,25 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 				btcAddress: existing.BTCAddress,
 				solAddress: existing.SOLAddress,
 			}
+		}
+	}
+
+	// Migrate wallet keys from the most recently created previous agent.
+	// Security note: this shares private keys across agent identities. The assumption
+	// is that killed agents under the same operator are being replaced, not compromised.
+	// If the old agent was killed for cause, the operator should generate fresh keys
+	// by deleting ~/.config/bob/config.json before running bob init.
+	if migrated := migrateWalletKeys(&cfg, agentID); migrated != nil {
+		if writeErr := writeCLIConfig(cliConfigPath(), cfg); writeErr != nil {
+			return walletInitResult{err: "wallet: failed to save migrated keys: " + writeErr.Error()}
+		}
+		registerWalletBestEffort(agentID, "evm", migrated.EVMAddress)
+		registerWalletBestEffort(agentID, "btc", migrated.BTCAddress)
+		registerWalletBestEffort(agentID, "solana", migrated.SOLAddress)
+		return walletInitResult{
+			evmAddress: migrated.EVMAddress,
+			btcAddress: migrated.BTCAddress,
+			solAddress: migrated.SOLAddress,
 		}
 	}
 
@@ -5011,6 +5030,50 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		result.err = "wallet registration: " + strings.Join(regWarnings, "; ")
 	}
 	return result
+}
+
+// migrateWalletKeys finds wallet keys from a previous agent in the keyring and
+// migrates them to the new agent ID. Returns the migrated keys or nil if none found.
+// Cleans up the old keyring entry to prevent re-migration.
+func migrateWalletKeys(cfg *cliConfig, newAgentID string) *agentWalletKeys {
+	if cfg.WalletKeyring == nil {
+		return nil
+	}
+
+	// Find the best candidate: pick the most recent entry (highest ID lexically).
+	// In practice there's usually only one other entry.
+	var bestID string
+	var bestKeys agentWalletKeys
+	for oldID, oldKeys := range cfg.WalletKeyring {
+		if oldID == newAgentID || oldKeys.EVMAddress == "" {
+			continue
+		}
+		if bestID == "" || oldID > bestID {
+			bestID = oldID
+			bestKeys = oldKeys
+		}
+	}
+	if bestID == "" {
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "\n  ⚠ WALLET KEY MIGRATION: reusing keys from agent %s for new agent %s\n", bestID, newAgentID)
+	fmt.Fprintf(os.Stderr, "    EVM: %s | BTC: %s | SOL: %s\n", bestKeys.EVMAddress, bestKeys.BTCAddress, bestKeys.SOLAddress)
+	fmt.Fprintf(os.Stderr, "    If the previous agent was compromised, delete ~/.config/bob/config.json and re-run bob init.\n\n")
+
+	// Copy to new agent, remove old entry
+	cfg.WalletKeyring[newAgentID] = bestKeys
+	delete(cfg.WalletKeyring, bestID)
+
+	// Update legacy flat fields
+	cfg.EVMPrivateKey = bestKeys.EVMPrivateKey
+	cfg.EVMAddress = bestKeys.EVMAddress
+	cfg.BTCPrivateKey = bestKeys.BTCPrivateKey
+	cfg.BTCAddress = bestKeys.BTCAddress
+	cfg.SOLPrivateKey = bestKeys.SOLPrivateKey
+	cfg.SOLAddress = bestKeys.SOLAddress
+
+	return &bestKeys
 }
 
 func registerWalletBestEffort(agentID, rail, address string) string {
