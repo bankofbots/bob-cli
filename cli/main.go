@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,11 +19,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
-const version = "0.41.0"
+const version = "0.42.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -5824,15 +5827,20 @@ func loanCmd() *cobra.Command {
 	// --- bob loan repay ---
 	repayCmd := &cobra.Command{
 		Use:   "repay [loan-id]",
-		Short: "Record a loan repayment",
-		Args:  cobra.ExactArgs(1),
-		RunE:  runLoanRepay,
+		Short: "Repay a loan (executes on-chain USDC transfer)",
+		Long: `Repay a loan by transferring USDC to the lending Safe.
+
+Without --tx: executes an on-chain USDC transfer from the borrower wallet
+to the lending Safe, then records the repayment. Requires --amount.
+
+With --tx: records an already-completed transaction as a repayment.
+Requires both --tx and --amount.`,
+		Args: cobra.ExactArgs(1),
+		RunE: runLoanRepay,
 	}
 	repayCmd.Flags().String("agent-id", "", "Agent ID")
-	repayCmd.Flags().String("tx", "", "Repayment transaction hash")
-	repayCmd.Flags().Int64("amount", 0, "Repayment amount in USDC (smallest unit)")
-	_ = repayCmd.MarkFlagRequired("tx")
-	_ = repayCmd.MarkFlagRequired("amount")
+	repayCmd.Flags().String("tx", "", "Existing transaction hash (skip on-chain execution)")
+	repayCmd.Flags().Int64("amount", 0, "Repayment amount in USDC micro-units (required)")
 	cmd.AddCommand(repayCmd)
 
 	// --- bob loan list ---
@@ -6109,6 +6117,22 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 	txHash, _ := cmd.Flags().GetString("tx")
 	amount, _ := cmd.Flags().GetInt64("amount")
 
+	// --amount is always required.
+	if amount <= 0 {
+		emitError("bob loan repay", fmt.Errorf("--amount is required (USDC micro-units, e.g. 2000000 for $2)"))
+		return nil
+	}
+
+	// If no tx hash provided, execute the on-chain USDC transfer automatically.
+	if txHash == "" {
+		hash, _, err := executeLoanRepayment(loanID, agentID, amount)
+		if err != nil {
+			emitError("bob loan repay", err)
+			return nil
+		}
+		txHash = hash
+	}
+
 	resp, err := apiPost(fmt.Sprintf("/loans/agreements/%s/repayments",
 		url.PathEscape(loanID)), map[string]any{
 		"tx_hash": txHash,
@@ -6135,6 +6159,82 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 		},
 	})
 	return nil
+}
+
+// executeLoanRepayment fetches the loan status, loads the agent's EVM key,
+// and sends a USDC transfer to the lending Safe. Returns tx hash and amount.
+func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string, int64, error) {
+	if requestedAmount <= 0 {
+		return "", 0, fmt.Errorf("--amount is required for on-chain repayment")
+	}
+
+	// 1. Get loan status to find safe address, chain, and amount owed.
+	statusResp, err := apiGet(fmt.Sprintf("/loans/agreements/%s", url.PathEscape(loanID)))
+	if err != nil {
+		return "", 0, fmt.Errorf("get loan status: %w", err)
+	}
+
+	var loan struct {
+		Status          string `json:"status"`
+		Principal       int64  `json:"principal"`
+		InterestAccrued int64  `json:"interest_accrued"`
+		AmountRepaid    int64  `json:"amount_repaid"`
+		SafeAddress     string `json:"safe_address"`
+		ChainID         string `json:"chain_id"`
+		BorrowerWallet  string `json:"borrower_wallet"`
+	}
+	if err := json.Unmarshal(statusResp, &loan); err != nil {
+		return "", 0, fmt.Errorf("parse loan status: %w", err)
+	}
+
+	if loan.Status != "active" {
+		return "", 0, fmt.Errorf("loan is not active (status: %s)", loan.Status)
+	}
+	if loan.SafeAddress == "" {
+		return "", 0, fmt.Errorf("loan has no safe_address — cannot determine repayment destination")
+	}
+	if loan.ChainID == "" {
+		return "", 0, fmt.Errorf("loan has no chain_id")
+	}
+
+	totalOwed := loan.Principal + loan.InterestAccrued
+	outstanding := totalOwed - loan.AmountRepaid
+	if outstanding <= 0 {
+		return "", 0, fmt.Errorf("nothing to repay (total owed: %d, already repaid: %d)", totalOwed, loan.AmountRepaid)
+	}
+
+	repayAmount := requestedAmount
+	if repayAmount > outstanding {
+		return "", 0, fmt.Errorf("repayment amount %d exceeds outstanding balance %d — tokens would be sent on-chain before server rejects", repayAmount, outstanding)
+	}
+
+	// 2. Load EVM private key.
+	cfg, loadErr := loadCLIConfig()
+	if loadErr != nil {
+		return "", 0, fmt.Errorf("load config: %w", loadErr)
+	}
+	keys := cfg.activeWalletKeys()
+	if keys == nil || keys.EVMPrivateKey == "" {
+		return "", 0, fmt.Errorf("no EVM wallet key found — run 'bob init' first")
+	}
+
+	// 3. Execute the on-chain USDC transfer via Safe (or direct EOA fallback).
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	borrowerWallet := common.HexToAddress(loan.BorrowerWallet)
+	lenderSafe := common.HexToAddress(loan.SafeAddress)
+	amount := big.NewInt(repayAmount)
+
+	fmt.Fprintf(os.Stderr, "repaying %d USDC (micro) from %s to %s on chain %s...\n",
+		repayAmount, loan.BorrowerWallet, loan.SafeAddress, loan.ChainID)
+
+	hash, err := evmRepayLoan(ctx, keys.EVMPrivateKey, loan.ChainID, borrowerWallet, lenderSafe, amount)
+	if err != nil {
+		return "", 0, fmt.Errorf("on-chain transfer failed: %w", err)
+	}
+
+	return hash.Hex(), repayAmount, nil
 }
 
 func runLoanList(cmd *cobra.Command, args []string) error {
