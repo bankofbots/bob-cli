@@ -24,7 +24,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.45.0"
+const version = "0.46.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -2107,7 +2107,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					healthResult["min_cli_version"] = minCLI
 					if semverLessThan(version, minCLI) {
 						warnings = append(warnings, fmt.Sprintf(
-							"CLI v%s — API requires v%s+. Download latest: https://github.com/bankofbots/bob-agent-kit/releases/latest",
+							"CLI v%s — API requires v%s+. Download latest: https://github.com/bankofbots/bob-cli/releases/latest",
 							version, minCLI,
 						))
 						healthResult["version_compatible"] = false
@@ -6559,4 +6559,3 @@ func runLoanRequestCancel(cmd *cobra.Command, args []string) error {
 	})
 	return nil
 }
-

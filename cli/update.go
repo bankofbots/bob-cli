@@ -53,8 +53,8 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		emitErrorWithActions("bob update",
 			fmt.Errorf("binary at %s is not writable: %w", currentBin, err),
 			[]NextAction{
-				{Command: "npm install -g @bankofbots/skill@latest", Description: "Update via npm (includes binary)"},
-				{Command: fmt.Sprintf("curl -sL https://github.com/bankofbots/bob-cli/releases/latest | tar xz -C ~/.local/bin/"), Description: "Download to a writable location"},
+				{Command: "Download the latest bob binary from https://github.com/bankofbots/bob-cli/releases/latest", Description: "Install a fresh binary from GitHub Releases"},
+				{Command: "bob --version", Description: "Verify which bob binary is on your PATH"},
 			})
 		return nil
 	} else {
@@ -225,7 +225,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		emitErrorWithActions("bob update",
 			fmt.Errorf("cannot rename binary at %s: %w", currentBin, err),
 			[]NextAction{
-				{Command: "npm install -g @bankofbots/skill@latest", Description: "Update via npm instead"},
+				{Command: "Download the latest bob binary from https://github.com/bankofbots/bob-cli/releases/latest", Description: "Replace the binary manually"},
 			})
 		return nil
 	}
@@ -243,7 +243,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		emitErrorWithActions("bob update",
 			fmt.Errorf("cannot write to %s: %w", currentBin, err),
 			[]NextAction{
-				{Command: "npm install -g @bankofbots/skill@latest", Description: "Update via npm instead"},
+				{Command: "Download the latest bob binary from https://github.com/bankofbots/bob-cli/releases/latest", Description: "Replace the binary manually"},
 			})
 		return nil
 	}
