@@ -63,6 +63,20 @@ func generateWalletKeys(btcHRP string) (*walletKeys, error) {
 	}, nil
 }
 
+// rederiveBTCAddress regenerates a BTC bech32 address from a hex-encoded secp256k1
+// private key (the same key used for EVM). Returns the new address or an error.
+func rederiveBTCAddress(privKeyHex, hrp string) (string, error) {
+	privBytes, err := hex.DecodeString(privKeyHex)
+	if err != nil {
+		return "", fmt.Errorf("decode private key hex: %w", err)
+	}
+	ecKey, err := ethcrypto.ToECDSA(privBytes)
+	if err != nil {
+		return "", fmt.Errorf("parse secp256k1 key: %w", err)
+	}
+	return pubkeyToBech32(&ecKey.PublicKey, hrp)
+}
+
 // pubkeyToBech32 derives a BTC bech32 P2WPKH address from a secp256k1 public key.
 // hrp is the human-readable part: "bc" for mainnet, "tb" for testnet, "bcrt" for regtest.
 func pubkeyToBech32(pub *ecdsa.PublicKey, hrp string) (string, error) {

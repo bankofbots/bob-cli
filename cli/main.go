@@ -24,7 +24,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.43.0"
+const version = "0.44.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1897,6 +1897,14 @@ func initSession(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// If --name was provided but agentName wasn't populated from claim-code redeem,
+	// honour the flag so the init output includes the name (e.g. --agent-id --api-key --name path).
+	if agentName == "" {
+		if trimmedName := strings.TrimSpace(nameFlag); trimmedName != "" {
+			agentName = trimmedName
+		}
+	}
+
 	shouldPrintAPIKey := showAPIKey || term.IsTerminal(int(os.Stderr.Fd()))
 	if shouldPrintAPIKey {
 		fmt.Fprintf(os.Stderr, "\n  *** Save this API key now — it will not be shown again ***\n  %s\n\n", initAPIKey)
@@ -1948,13 +1956,18 @@ func initSession(cmd *cobra.Command, args []string) error {
 		{Command: "bob auth me", Description: "Verify your key and role"},
 		{Command: "bob doctor", Description: "Show active API URL + auth/config status"},
 		{Command: fmt.Sprintf("bob agent get %s", agentID), Description: "Inspect agent details"},
-		{Command: fmt.Sprintf("bob intent quote %s --amount 1000 --currency BTC --destination-type lightning --destination-ref <node-pubkey>", agentID), Description: "Get a payment quote"},
+	}
+
+	if agentName == "" {
+		nextActions = append(nextActions, NextAction{
+			Command:     "bob agent profile set --name <name>",
+			Description: "Set your agent display name and handle",
+		})
 	}
 
 	if platform == "claude" || platform == "openclaw" {
 		nextActions = append([]NextAction{
-			{Command: "mkdir -p .claude/skills/bankofbots", Description: "Ensure local Claude/OpenClaw skill directory exists"},
-			{Command: "curl -fsSL \"$DASHBOARD_ORIGIN/api/skill/bankofbots?download=1\" -o .claude/skills/bankofbots/SKILL.md", Description: "Download the Bank of Bots skill file"},
+			{Command: "npm install @bankofbots/skill@latest", Description: "Install the Bank of Bots skill package"},
 		}, nextActions...)
 	}
 
@@ -2137,6 +2150,43 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		warnings = append(warnings, "set BOB_API_KEY (or use --api-key) to run authenticated checks")
 	}
 	result["auth"] = authResult
+
+	// --- Setup completeness checks ---
+	missing := []string{}
+
+	// Check wallet keys in local config.
+	doctorCfg, cfgErr := loadCLIConfig()
+	if cfgErr == nil {
+		if wk := doctorCfg.activeWalletKeys(); wk == nil || wk.EVMAddress == "" {
+			missing = append(missing, "wallet_keys")
+			warnings = append(warnings, "no local wallet keys found; run 'bob init' to generate and register wallets")
+		}
+	} else {
+		missing = append(missing, "wallet_keys")
+		warnings = append(warnings, "could not load CLI config to check wallet keys")
+	}
+
+	// Check passport existence via API.
+	resolvedAgentID := strings.TrimSpace(os.Getenv("BOB_AGENT_ID"))
+	if cfgErr == nil && resolvedAgentID == "" {
+		resolvedAgentID = doctorCfg.AgentID
+	}
+	if resolvedAgentID != "" && strings.TrimSpace(apiKey) != "" {
+		_, passportErr := apiGet("/agents/" + resolvedAgentID + "/credential")
+		if passportErr != nil {
+			errMsg := extractAPIErrorMessage(passportErr)
+			if strings.Contains(errMsg, "404") || strings.Contains(strings.ToLower(errMsg), "not found") {
+				missing = append(missing, "passport")
+				warnings = append(warnings, "no passport issued; run 'bob init' to create one")
+			}
+		}
+	}
+
+	if len(missing) > 0 {
+		result["setup_incomplete"] = true
+		result["missing"] = missing
+	}
+
 	result["warnings"] = warnings
 
 	nextActions := []NextAction{
@@ -2144,6 +2194,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 	if strings.TrimSpace(apiKey) == "" {
 		nextActions = append(nextActions, NextAction{Command: "export BOB_API_KEY=<your-key>", Description: "Set API key for authenticated commands"})
+	}
+	if len(missing) > 0 {
+		nextActions = append(nextActions, NextAction{
+			Command:     "bob init --code <claim-code> --name <name>",
+			Description: "Complete setup — generates wallet keys and passport",
+		})
 	}
 
 	emit(Envelope{
@@ -5058,6 +5114,28 @@ func migrateWalletKeys(cfg *cliConfig, newAgentID string) *agentWalletKeys {
 	}
 	if bestID == "" {
 		return nil
+	}
+
+	// Check if the BTC address prefix matches the current environment.
+	// If the old agent was pointing at a different network (e.g. localhost/regtest),
+	// the BTC address will have the wrong prefix and can never bind on the current network.
+	expectedHRP := "bc"
+	loweredBase := strings.ToLower(apiBase)
+	if strings.Contains(loweredBase, "localhost") || strings.Contains(loweredBase, "127.0.0.1") {
+		expectedHRP = "bcrt"
+	} else if strings.Contains(loweredBase, "testnet") {
+		expectedHRP = "tb"
+	}
+
+	if bestKeys.BTCAddress != "" && !strings.HasPrefix(bestKeys.BTCAddress, expectedHRP+"1") {
+		newAddr, err := rederiveBTCAddress(bestKeys.BTCPrivateKey, expectedHRP)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "\n  ⚠ BTC ADDRESS PREFIX MISMATCH: old %s does not match expected prefix %q for current API\n", bestKeys.BTCAddress, expectedHRP)
+			fmt.Fprintf(os.Stderr, "    Regenerated BTC address: %s\n", newAddr)
+			bestKeys.BTCAddress = newAddr
+		} else {
+			fmt.Fprintf(os.Stderr, "\n  ⚠ BTC ADDRESS PREFIX MISMATCH: old %s (expected %q), but re-derivation failed: %v\n", bestKeys.BTCAddress, expectedHRP, err)
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "\n  ⚠ WALLET KEY MIGRATION: reusing keys from agent %s for new agent %s\n", bestID, newAgentID)
