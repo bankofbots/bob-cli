@@ -24,7 +24,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.47.0"
+const version = "0.48.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -5014,22 +5014,52 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		}
 	}
 
-	// Migrate wallet keys from the most recently created previous agent.
-	// Security note: this shares private keys across agent identities. The assumption
-	// is that killed agents under the same operator are being replaced, not compromised.
-	// If the old agent was killed for cause, the operator should generate fresh keys
-	// by deleting ~/.config/bob/config.json before running bob init.
+	// Try to migrate wallet keys from a previous agent in the keyring.
+	// Only fall through to fresh keys on ownership conflicts (409 with different
+	// operator). Transient errors (401, 500, network) keep the migrated keys.
 	if migrated := migrateWalletKeys(&cfg, agentID); migrated != nil {
 		if writeErr := writeCLIConfig(cliConfigPath(), cfg); writeErr != nil {
 			return walletInitResult{err: "wallet: failed to save migrated keys: " + writeErr.Error()}
 		}
-		registerWalletBestEffort(agentID, "evm", migrated.EVMAddress)
-		registerWalletBestEffort(agentID, "btc", migrated.BTCAddress)
-		registerWalletBestEffort(agentID, "solana", migrated.SOLAddress)
-		return walletInitResult{
-			evmAddress: migrated.EVMAddress,
-			btcAddress: migrated.BTCAddress,
-			solAddress: migrated.SOLAddress,
+
+		// Test EVM registration first (don't register BTC/SOL yet).
+		// If EVM fails due to ownership conflict, abandon migration for ALL rails
+		// to keep local and server state in sync.
+		evmWarn := registerWalletBestEffort(agentID, "evm", migrated.EVMAddress)
+
+		isOwnershipConflict := evmWarn != "" &&
+			(strings.Contains(evmWarn, "409") || strings.Contains(evmWarn, "403")) &&
+			!strings.Contains(evmWarn, "already registered for this agent")
+
+		if isOwnershipConflict {
+			fmt.Fprintf(os.Stderr, "  migrated EVM wallet rejected (address belongs to another agent) — generating fresh keys\n")
+			fmt.Fprintf(os.Stderr, "  old keys preserved in keyring (funds at %s are still accessible)\n", migrated.EVMAddress)
+			// Backup with timestamp to avoid overwriting previous backups.
+			backupKey := fmt.Sprintf("_backup_%s_%d", agentID, time.Now().Unix())
+			if old, ok := cfg.WalletKeyring[agentID]; ok {
+				cfg.WalletKeyring[backupKey] = old
+				delete(cfg.WalletKeyring, agentID)
+			}
+			_ = writeCLIConfig(cliConfigPath(), cfg)
+			// Fall through to fresh key generation below.
+		} else {
+			// EVM succeeded or had a non-ownership error — proceed with BTC/SOL.
+			btcWarn := registerWalletBestEffort(agentID, "btc", migrated.BTCAddress)
+			solWarn := registerWalletBestEffort(agentID, "solana", migrated.SOLAddress)
+
+			var regWarnings []string
+			if evmWarn != "" { regWarnings = append(regWarnings, evmWarn) }
+			if btcWarn != "" { regWarnings = append(regWarnings, btcWarn) }
+			if solWarn != "" { regWarnings = append(regWarnings, solWarn) }
+			result := walletInitResult{
+				evmAddress: migrated.EVMAddress,
+				btcAddress: migrated.BTCAddress,
+				solAddress: migrated.SOLAddress,
+			}
+			if len(regWarnings) > 0 {
+				result.err = "wallet registration: " + strings.Join(regWarnings, "; ")
+			}
+			return result
 		}
 	}
 
@@ -5106,7 +5136,7 @@ func migrateWalletKeys(cfg *cliConfig, newAgentID string) *agentWalletKeys {
 	var bestID string
 	var bestKeys agentWalletKeys
 	for oldID, oldKeys := range cfg.WalletKeyring {
-		if oldID == newAgentID || oldKeys.EVMAddress == "" {
+		if oldID == newAgentID || oldKeys.EVMAddress == "" || strings.HasPrefix(oldID, "_backup_") {
 			continue
 		}
 		if bestID == "" || oldID > bestID {
@@ -5178,19 +5208,34 @@ func registerWalletBestEffort(agentID, rail, address string) string {
 	}
 	if sig := signWalletRegistration(agentID, rail, address); sig != "" {
 		payload["signature"] = sig
+	} else {
+		fmt.Fprintf(os.Stderr, "  wallet-register %s: no signature generated (key not in keyring for agent %s)\n", rail, agentID)
 	}
 
 	_, err := apiPost(fmt.Sprintf("/agents/%s/wallets", url.PathEscape(agentID)), payload)
 	if err == nil {
+		fmt.Fprintf(os.Stderr, "  wallet-register %s: ✓ registered %s\n", rail, address)
 		return ""
 	}
+
+	errStr := err.Error()
+	fmt.Fprintf(os.Stderr, "  wallet-register %s: FAILED — %s\n", rail, errStr)
+
 	// 409 (duplicate) is expected on re-init — don't warn
-	if strings.Contains(err.Error(), "409") {
+	if strings.Contains(errStr, "409") {
 		return ""
 	}
-	// 403 (no trust signal) is expected before wallet binding — gentle hint
-	if strings.Contains(err.Error(), "403") {
-		return fmt.Sprintf("%s: bind wallet first (bob binding challenge --rail %s --address <addr>)", rail, rail)
+	// 403 (signature failed or no trust signal)
+	if strings.Contains(errStr, "403") {
+		return fmt.Sprintf("%s: wallet registration rejected (403) — %s", rail, extractAPIErrorMessage(err))
+	}
+	// 401 = auth issue
+	if strings.Contains(errStr, "401") {
+		return fmt.Sprintf("%s: wallet registration auth failed (401) — API key may not be valid for this agent", rail)
+	}
+	// 400 = bad request (e.g., missing signature)
+	if strings.Contains(errStr, "400") {
+		return fmt.Sprintf("%s: wallet registration bad request (400) — %s", rail, extractAPIErrorMessage(err))
 	}
 	return fmt.Sprintf("%s: %s", rail, extractAPIErrorMessage(err))
 }
