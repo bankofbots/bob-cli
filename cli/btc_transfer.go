@@ -29,7 +29,16 @@ const defaultMempoolBase = "https://mempool.space"
 
 func mempoolBaseURL() string {
 	if env := os.Getenv("BOB_BTC_MEMPOOL_URL"); env != "" {
-		return strings.TrimRight(env, "/")
+		trimmed := strings.TrimRight(env, "/")
+		// Allow http only for localhost/127.0.0.1 (testing). Reject plain HTTP otherwise.
+		if strings.HasPrefix(trimmed, "http://") &&
+			!strings.Contains(trimmed, "localhost") &&
+			!strings.Contains(trimmed, "127.0.0.1") {
+			fmt.Fprintf(os.Stderr, "⚠ BOB_BTC_MEMPOOL_URL uses HTTP — rejecting for security. Use HTTPS or localhost.\n")
+			// Fall through to default
+		} else {
+			return trimmed
+		}
 	}
 	// Derive from apiBase: testnet → testnet mempool, localhost → signet.
 	lowered := strings.ToLower(apiBase)

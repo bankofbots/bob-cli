@@ -24,7 +24,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.49.0"
+const version = "0.50.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -242,11 +242,13 @@ func dashboardOriginFromAPIBase(base string) string {
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	switch {
 	case strings.HasPrefix(host, "api-"):
-		// api-testnet.bobscore.ai → testnet.bobscore.ai (env-prefixed subdomain)
+		// api-testnet.bankofbots.ai → testnet.bankofbots.ai (env-prefixed subdomain)
 		host = strings.TrimPrefix(host, "api-")
+	case host == "api.bankofbots.ai":
+		return u.Scheme + "://bankofbots.ai"
 	case host == "api.bobscore.ai":
-		// api.bobscore.ai → bobscore.ai
-		return u.Scheme + "://bobscore.ai"
+		// Legacy: redirect to new domain
+		return u.Scheme + "://bankofbots.ai"
 	case strings.HasPrefix(host, "api."):
 		host = "app." + strings.TrimPrefix(host, "api.")
 	case host == "localhost" || host == "127.0.0.1":
@@ -5003,12 +5005,32 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 	// If this agent already has keys in the keyring, reuse them.
 	if loadErr == nil && cfg.AgentID == agentID {
 		if existing := cfg.activeWalletKeys(); existing != nil && existing.EVMAddress != "" {
+			// Fix BTC address if it has the wrong network prefix (e.g., bcrt1q on prod).
+			btcAddr := existing.BTCAddress
+			expectedHRP := "bc"
+			lowered := strings.ToLower(apiBase)
+			if strings.Contains(lowered, "localhost") || strings.Contains(lowered, "127.0.0.1") {
+				expectedHRP = "bcrt"
+			} else if strings.Contains(lowered, "testnet") {
+				expectedHRP = "tb"
+			}
+			if btcAddr != "" && !strings.HasPrefix(btcAddr, expectedHRP+"1") {
+				if newAddr, err := rederiveBTCAddress(existing.BTCPrivateKey, expectedHRP); err == nil {
+					fmt.Fprintf(os.Stderr, "  btc: re-derived address %s → %s (network prefix mismatch)\n", btcAddr, newAddr)
+					btcAddr = newAddr
+					existing.BTCAddress = newAddr
+					cfg.WalletKeyring[agentID] = *existing
+					cfg.BTCAddress = newAddr
+					_ = writeCLIConfig(cliConfigPath(), cfg)
+				}
+			}
+
 			registerWalletBestEffort(agentID, "evm", existing.EVMAddress)
-			registerWalletBestEffort(agentID, "btc", existing.BTCAddress)
+			registerWalletBestEffort(agentID, "btc", btcAddr)
 			registerWalletBestEffort(agentID, "solana", existing.SOLAddress)
 			return walletInitResult{
 				evmAddress: existing.EVMAddress,
-				btcAddress: existing.BTCAddress,
+				btcAddress: btcAddr,
 				solAddress: existing.SOLAddress,
 			}
 		}
@@ -5192,8 +5214,11 @@ func migrateWalletKeys(cfg *cliConfig, newAgentID string) *agentWalletKeys {
 // walletRegistrationMessage returns the deterministic message that must be
 // signed to prove private key ownership during wallet registration.
 // Must match the server-side function in treasury.go.
-func walletRegistrationMessage(agentID, rail, address string) string {
-	return fmt.Sprintf("bob:register-wallet:%s:%s:%s", agentID, rail, strings.ToLower(address))
+// walletRegistrationMessage returns the message that must be signed to prove
+// private key ownership during wallet registration. Includes a unix timestamp
+// to prevent replay attacks — the server rejects signatures older than 5 minutes.
+func walletRegistrationMessage(agentID, rail, address string, timestamp int64) string {
+	return fmt.Sprintf("bob:register-wallet:%s:%s:%s:%d", agentID, rail, strings.ToLower(address), timestamp)
 }
 
 func registerWalletBestEffort(agentID, rail, address string) string {
@@ -5206,8 +5231,9 @@ func registerWalletBestEffort(agentID, rail, address string) string {
 		"rail":    rail,
 		"address": address,
 	}
-	if sig := signWalletRegistration(agentID, rail, address); sig != "" {
+	if sig, ts := signWalletRegistration(agentID, rail, address); sig != "" {
 		payload["signature"] = sig
+		payload["signature_timestamp"] = ts
 	} else {
 		fmt.Fprintf(os.Stderr, "  wallet-register %s: no signature generated (key not in keyring for agent %s)\n", rail, agentID)
 	}
@@ -5241,12 +5267,12 @@ func registerWalletBestEffort(agentID, rail, address string) string {
 }
 
 // signWalletRegistration signs the wallet registration message with the
-// locally-stored private key for the given rail. Returns empty string if
-// the key is not available (e.g., operator-initiated registration).
-func signWalletRegistration(agentID, rail, address string) string {
+// locally-stored private key for the given rail. Returns signature and unix
+// timestamp. Empty signature if key is not available.
+func signWalletRegistration(agentID, rail, address string) (sig string, timestamp int64) {
 	cfg, err := loadCLIConfig()
 	if err != nil {
-		return ""
+		return "", 0
 	}
 	var keys *agentWalletKeys
 	if cfg.WalletKeyring != nil {
@@ -5255,36 +5281,37 @@ func signWalletRegistration(agentID, rail, address string) string {
 		}
 	}
 	if keys == nil {
-		return ""
+		return "", 0
 	}
 
-	msg := walletRegistrationMessage(agentID, rail, address)
-	var sig string
+	now := time.Now().Unix()
+	msg := walletRegistrationMessage(agentID, rail, address, now)
+	var s string
 	var signErr error
 
 	switch rail {
 	case "evm":
 		if keys.EVMPrivateKey == "" {
-			return ""
+			return "", 0
 		}
-		sig, signErr = signEVMChallenge(msg, keys.EVMPrivateKey)
+		s, signErr = signEVMChallenge(msg, keys.EVMPrivateKey)
 	case "btc":
 		if keys.BTCPrivateKey == "" {
-			return ""
+			return "", 0
 		}
-		sig, signErr = signBTCChallenge(msg, keys.BTCPrivateKey)
+		s, signErr = signBTCChallenge(msg, keys.BTCPrivateKey)
 	case "solana":
 		if keys.SOLPrivateKey == "" {
-			return ""
+			return "", 0
 		}
-		sig, signErr = signSolanaChallenge(msg, keys.SOLPrivateKey)
+		s, signErr = signSolanaChallenge(msg, keys.SOLPrivateKey)
 	default:
-		return ""
+		return "", 0
 	}
 	if signErr != nil {
-		return ""
+		return "", 0
 	}
-	return sig
+	return s, now
 }
 
 func walletCmd() *cobra.Command {
@@ -5537,8 +5564,9 @@ func runWalletRegister(cmd *cobra.Command, args []string) error {
 		"rail":    strings.ToLower(strings.TrimSpace(rail)),
 		"address": strings.TrimSpace(address),
 	}
-	if sig := signWalletRegistration(agentID, strings.ToLower(strings.TrimSpace(rail)), strings.TrimSpace(address)); sig != "" {
+	if sig, ts := signWalletRegistration(agentID, strings.ToLower(strings.TrimSpace(rail)), strings.TrimSpace(address)); sig != "" {
 		payload["signature"] = sig
+		payload["signature_timestamp"] = ts
 	}
 
 	resp, err := apiPost(fmt.Sprintf("/agents/%s/wallets", url.PathEscape(agentID)), payload)
