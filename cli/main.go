@@ -24,7 +24,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.48.0"
+const version = "0.49.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
