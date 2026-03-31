@@ -23,7 +23,11 @@ func autoBindWalletBestEffort(agentID string) []string {
 	if err != nil {
 		return []string{"wallet-bind: failed to load config: " + err.Error()}
 	}
-	keys := cfg.activeWalletKeys()
+	// Use the explicit agentID for key lookup, falling back to active agent.
+	keys := cfg.walletKeysForAgent(agentID)
+	if keys == nil {
+		keys = cfg.activeWalletKeys()
+	}
 	if keys == nil {
 		return []string{"wallet-bind: no wallet keys found for agent " + agentID}
 	}

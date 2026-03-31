@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.50.3"
+const version = "0.51.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -116,10 +116,14 @@ func (c *cliConfig) migrateWalletKeyring() {
 
 // activeWalletKeys returns the wallet keys for the current agent, or nil.
 func (c *cliConfig) activeWalletKeys() *agentWalletKeys {
+	return c.walletKeysForAgent(c.AgentID)
+}
+
+func (c *cliConfig) walletKeysForAgent(agentID string) *agentWalletKeys {
 	if c.WalletKeyring == nil {
 		return nil
 	}
-	keys, ok := c.WalletKeyring[c.AgentID]
+	keys, ok := c.WalletKeyring[agentID]
 	if !ok {
 		return nil
 	}
@@ -4344,14 +4348,49 @@ func bindingCmd() *cobra.Command {
 	verifyCmd.Flags().String("rail", "", "Rail: evm, btc, or solana (required)")
 	verifyCmd.Flags().String("challenge-id", "", "Challenge id (required)")
 	verifyCmd.Flags().String("address", "", "Wallet address (required)")
-	verifyCmd.Flags().String("signature", "", "Signature over challenge message (required)")
+	verifyCmd.Flags().String("signature", "", "Signature over challenge message (omit to auto-sign with local key)")
+	verifyCmd.Flags().String("agent-id", "", "Agent ID (for auto-sign key lookup)")
 	verifyCmd.Flags().String("chain-id", "", "Optional hex chain id (EVM only, e.g. 0x1 or 0x2105)")
 	verifyCmd.Flags().String("wallet-type", "", "Optional wallet type for EVM only (e.g. coinbase)")
 	verifyCmd.MarkFlagRequired("rail")
 	verifyCmd.MarkFlagRequired("challenge-id")
 	verifyCmd.MarkFlagRequired("address")
-	verifyCmd.MarkFlagRequired("signature")
+	// Note: --signature is NOT required — if omitted with --message, auto-signs with local key.
 	cmd.AddCommand(verifyCmd)
+
+	// bob binding auto — one-shot bind all local wallets
+	autoCmd := &cobra.Command{
+		Use:   "auto",
+		Short: "Auto-bind all wallets from local keyring (challenge + sign + verify)",
+		Long:  "Automatically binds all wallets stored in your local keyring. No Python or external tools needed — signing uses the CLI's built-in crypto.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			agentID := resolveAgentID(cmd)
+			warnings := autoBindWalletBestEffort(agentID)
+			if len(warnings) > 0 {
+				emit(Envelope{
+					OK:      false,
+					Command: "bob binding auto",
+					Data:    map[string]any{"warnings": warnings},
+					NextActions: []NextAction{
+						{Command: "bob wallet list", Description: "Check wallet status"},
+					},
+				})
+				return nil
+			}
+			emit(Envelope{
+				OK:      true,
+				Command: "bob binding auto",
+				Data:    map[string]any{"message": "All local wallets bound successfully."},
+				NextActions: []NextAction{
+					{Command: "bob score me", Description: "Check updated BOB Score"},
+					{Command: "bob wallet list", Description: "View bound wallets"},
+				},
+			})
+			return nil
+		},
+	}
+	autoCmd.Flags().String("agent-id", "", "Agent ID")
+	cmd.AddCommand(autoCmd)
 
 	return cmd
 }
@@ -4409,6 +4448,7 @@ func operatorGenericBindVerify(cmd *cobra.Command, args []string) error {
 	signature, _ := cmd.Flags().GetString("signature")
 	chainID, _ := cmd.Flags().GetString("chain-id")
 	walletType, _ := cmd.Flags().GetString("wallet-type")
+	agentID := resolveAgentID(cmd)
 	rail, err := normalizeBindingRail(railRaw)
 	if err != nil {
 		emitError("bob binding verify", err)
@@ -4417,10 +4457,77 @@ func operatorGenericBindVerify(cmd *cobra.Command, args []string) error {
 	chainID = strings.TrimSpace(chainID)
 	walletType = strings.TrimSpace(strings.ToLower(walletType))
 
+	signature = strings.TrimSpace(signature)
+	address = strings.TrimSpace(address)
+	challengeID = strings.TrimSpace(challengeID)
+
+	// Auto-sign: if no --signature, fetch challenge from server and sign locally.
+	if signature == "" {
+		cfg, cfgErr := loadCLIConfig()
+		if cfgErr != nil {
+			emitError("bob binding verify", fmt.Errorf("no --signature and failed to load keyring: %w", cfgErr))
+			return nil
+		}
+		keys := cfg.walletKeysForAgent(agentID)
+		if keys == nil {
+			keys = cfg.activeWalletKeys() // fallback to current config agent
+		}
+		if keys == nil {
+			emitErrorWithActions("bob binding verify", fmt.Errorf("no --signature and no local wallet keys found"), []NextAction{
+				{Command: "bob binding auto", Description: "Auto-bind all local wallets"},
+			})
+			return nil
+		}
+
+		// Match address to local key.
+		var privKey string
+		switch rail {
+		case "evm":
+			if strings.EqualFold(strings.TrimSpace(keys.EVMAddress), address) {
+				privKey = keys.EVMPrivateKey
+			}
+		case "btc":
+			if strings.TrimSpace(keys.BTCAddress) == address {
+				privKey = keys.BTCPrivateKey
+			}
+		case "solana":
+			if strings.TrimSpace(keys.SOLAddress) == address {
+				privKey = keys.SOLPrivateKey
+			}
+		}
+		if privKey == "" {
+			emitErrorWithActions("bob binding verify", fmt.Errorf("address %s not in local keyring for rail %s — provide --signature", address, rail), []NextAction{
+				{Command: "bob binding auto", Description: "Auto-bind all local wallets"},
+			})
+			return nil
+		}
+
+		// Fetch challenge message from server (never sign caller-provided text).
+		challengeResp, fetchErr := apiGet(fmt.Sprintf("/operators/me/wallet-bindings/challenges/%s", url.PathEscape(challengeID)))
+		if fetchErr != nil {
+			emitError("bob binding verify", fmt.Errorf("auto-sign: failed to fetch challenge from server: %w", fetchErr))
+			return nil
+		}
+		var challengeData struct {
+			Message string `json:"message"`
+		}
+		if parseErr := json.Unmarshal(challengeResp, &challengeData); parseErr != nil || challengeData.Message == "" {
+			emitError("bob binding verify", fmt.Errorf("auto-sign: invalid challenge response from server"))
+			return nil
+		}
+
+		sig, signErr := signChallengeMessage(rail, challengeData.Message, privKey)
+		if signErr != nil {
+			emitError("bob binding verify", fmt.Errorf("auto-sign: signing failed: %w", signErr))
+			return nil
+		}
+		signature = sig
+	}
+
 	payload := map[string]any{
 		"challenge_id": strings.TrimSpace(challengeID),
 		"address":      strings.TrimSpace(address),
-		"signature":    strings.TrimSpace(signature),
+		"signature":    signature,
 	}
 	if chainID != "" && rail == "evm" {
 		payload["chain_id"] = chainID
