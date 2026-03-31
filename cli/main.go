@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.52.2"
+const version = "0.52.4"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -6282,14 +6282,36 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	nextActions := []NextAction{
+		{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check remaining balance"},
+		{Command: "bob loan list --agent-id " + agentID, Description: "List all loans"},
+	}
+
+	// Suggest importing the repayment as a payment proof to boost BOB Score.
+	if txHash != "" {
+		senderAddr := ""
+		if cfg, err := loadCLIConfig(); err == nil {
+			if keys := cfg.walletKeysForAgent(agentID); keys != nil {
+				senderAddr = keys.EVMAddress
+			} else if keys := cfg.activeWalletKeys(); keys != nil {
+				senderAddr = keys.EVMAddress
+			}
+		}
+		importCmd := fmt.Sprintf("bob agent credit-import %s --proof-type base_onchain_tx --proof-ref %s --rail onchain --currency USDC --amount %d --direction outbound",
+			agentID, txHash, amount)
+		if senderAddr != "" {
+			importCmd += " --sender-address " + senderAddr
+		}
+		nextActions = append([]NextAction{
+			{Command: importCmd, Description: "Import repayment as payment proof to boost BOB Score"},
+		}, nextActions...)
+	}
+
 	emit(Envelope{
 		OK:      true,
 		Command: "bob loan repay",
 		Data:    result,
-		NextActions: []NextAction{
-			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check remaining balance"},
-			{Command: "bob loan list --agent-id " + agentID, Description: "List all loans"},
-		},
+		NextActions: nextActions,
 	})
 	return nil
 }
