@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.50.0"
+const version = "0.50.3"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -67,6 +68,8 @@ type agentWalletKeys struct {
 	BTCAddress    string `json:"btc_address,omitempty"`
 	SOLPrivateKey string `json:"sol_private_key,omitempty"`
 	SOLAddress    string `json:"sol_address,omitempty"`
+	// Persistent Ed25519 key for passport-backed loan note signatures.
+	PassportEd25519PrivateKey string `json:"passport_ed25519_private_key,omitempty"`
 }
 
 type cliConfig struct {
@@ -377,6 +380,72 @@ func emitErrorWithActions(command string, err error, nextActions []NextAction) {
 		Data:        map[string]string{"error": err.Error()},
 		NextActions: nextActions,
 	})
+}
+
+func loanCommandWithAgent(command, agentID string) string {
+	if strings.TrimSpace(agentID) == "" {
+		return command
+	}
+	return command + " --agent-id " + agentID
+}
+
+// emitLoanPolicyError maps common lending-policy API errors to concrete next actions.
+// Returns true if the error was recognized and emitted.
+func emitLoanPolicyError(command string, err error, agentID string) bool {
+	msg := strings.TrimSpace(extractAPIErrorMessage(err))
+	if msg == "" {
+		return false
+	}
+	lower := strings.ToLower(msg)
+	rawLower := strings.ToLower(strings.TrimSpace(err.Error()))
+
+	defaultLockout := strings.Contains(lower, "recent loan defaults") ||
+		(strings.Contains(lower, "locked out") &&
+			(strings.Contains(lower, "loan") || strings.Contains(lower, "default")))
+
+	transientFacilityVerify := (strings.Contains(lower, "unable to verify operator facility") ||
+		strings.Contains(lower, "unable to verify operator")) &&
+		(strings.Contains(lower, "try again") || strings.Contains(rawLower, "api error (503)"))
+
+	switch {
+	case strings.Contains(lower, "active loans") && strings.Contains(lower, "maximum"):
+		emitErrorWithActions(command, err, []NextAction{
+			{Command: loanCommandWithAgent("bob loan list", agentID), Description: "Review active loans and balances"},
+			{Command: loanCommandWithAgent("bob loan repay <loan-id> --amount <usdc>", agentID), Description: "Repay an active loan to free capacity"},
+			{Command: loanCommandWithAgent("bob loan requests", agentID), Description: "Review pending requests"},
+		})
+		return true
+	case defaultLockout:
+		emitErrorWithActions(command, err, []NextAction{
+			{Command: loanCommandWithAgent("bob loan list", agentID), Description: "Review defaulted or overdue loans"},
+			{Command: loanCommandWithAgent("bob loan repay <loan-id> --amount <usdc>", agentID), Description: "Repay outstanding debt during lockout period"},
+			{Command: "bob auth me", Description: "Confirm current key/identity context"},
+		})
+		return true
+	case transientFacilityVerify:
+		emitErrorWithActions(command, err, []NextAction{
+			{Command: command, Description: "Retry after a short delay"},
+			{Command: "bob auth me", Description: "Verify connectivity and auth context"},
+		})
+		return true
+	case strings.Contains(lower, "credit facility") ||
+		strings.Contains(lower, "operator facility") ||
+		strings.Contains(lower, "facility limit"):
+		emitErrorWithActions(command, err, []NextAction{
+			{Command: "bob auth me", Description: "Verify agent/operator identity context"},
+			{Command: loanCommandWithAgent("bob loan eligibility", agentID), Description: "Re-check limits and eligibility"},
+			{Command: loanCommandWithAgent("bob loan requests", agentID), Description: "Review current requests and statuses"},
+		})
+		return true
+	case strings.Contains(lower, "agent is frozen") || strings.Contains(lower, "transactions suspended"):
+		emitErrorWithActions(command, err, []NextAction{
+			{Command: loanCommandWithAgent("bob loan list", agentID), Description: "Inspect loans and repayment status"},
+			{Command: "bob auth me", Description: "Verify account and operator context"},
+		})
+		return true
+	default:
+		return false
+	}
 }
 
 func roleHintFromAPIKey(raw string) (string, string) {
@@ -5070,9 +5139,15 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 			solWarn := registerWalletBestEffort(agentID, "solana", migrated.SOLAddress)
 
 			var regWarnings []string
-			if evmWarn != "" { regWarnings = append(regWarnings, evmWarn) }
-			if btcWarn != "" { regWarnings = append(regWarnings, btcWarn) }
-			if solWarn != "" { regWarnings = append(regWarnings, solWarn) }
+			if evmWarn != "" {
+				regWarnings = append(regWarnings, evmWarn)
+			}
+			if btcWarn != "" {
+				regWarnings = append(regWarnings, btcWarn)
+			}
+			if solWarn != "" {
+				regWarnings = append(regWarnings, solWarn)
+			}
 			result := walletInitResult{
 				evmAddress: migrated.EVMAddress,
 				btcAddress: migrated.BTCAddress,
@@ -5105,10 +5180,12 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		if cfg.WalletKeyring == nil {
 			cfg.WalletKeyring = make(map[string]agentWalletKeys)
 		}
+		existing := cfg.WalletKeyring[agentID]
 		cfg.WalletKeyring[agentID] = agentWalletKeys{
 			EVMPrivateKey: keys.EVMPrivateKey, EVMAddress: keys.EVMAddress,
 			BTCPrivateKey: keys.BTCPrivateKey, BTCAddress: keys.BTCAddress,
 			SOLPrivateKey: keys.SOLPrivateKey, SOLAddress: keys.SOLAddress,
+			PassportEd25519PrivateKey: existing.PassportEd25519PrivateKey,
 		}
 		// Also update legacy flat fields for backwards compat with older CLIs.
 		cfg.EVMPrivateKey = keys.EVMPrivateKey
@@ -5799,7 +5876,129 @@ func handleWalletProvisionCommand(agentID, commandID, payloadStr string) (map[st
 
 // ---------------------------------------------------------------------------
 
-const authKeyBindDomainPrefix = "BOB Passport Auth v1\n"
+const (
+	authKeyBindDomainPrefix    = "BOB Passport Auth v1\n"
+	loanNoteSignatureDomainKey = "BOB Loan Note v1\n"
+)
+
+type loanNoteAcceptanceMessage struct {
+	Kind       string `json:"kind"`
+	Version    string `json:"version"`
+	LoanID     string `json:"loan_id"`
+	AgentID    string `json:"agent_id"`
+	AcceptedAt string `json:"accepted_at"`
+}
+
+func saveAgentPassportSigningKey(agentID string, privKey ed25519.PrivateKey) error {
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.WalletKeyring == nil {
+		cfg.WalletKeyring = make(map[string]agentWalletKeys)
+	}
+	keys := cfg.WalletKeyring[agentID]
+	keys.PassportEd25519PrivateKey = base64.RawURLEncoding.EncodeToString(privKey)
+	cfg.WalletKeyring[agentID] = keys
+	return writeCLIConfig(cliConfigPath(), cfg)
+}
+
+func decodeStoredEd25519PrivateKey(encoded string) (ed25519.PrivateKey, error) {
+	rawB64, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err == nil {
+		switch len(rawB64) {
+		case ed25519.SeedSize:
+			return ed25519.NewKeyFromSeed(rawB64), nil
+		case ed25519.PrivateKeySize:
+			return ed25519.PrivateKey(rawB64), nil
+		}
+	}
+
+	rawHex, hexErr := hex.DecodeString(strings.TrimPrefix(encoded, "0x"))
+	if hexErr == nil {
+		switch len(rawHex) {
+		case ed25519.SeedSize:
+			return ed25519.NewKeyFromSeed(rawHex), nil
+		case ed25519.PrivateKeySize:
+			return ed25519.PrivateKey(rawHex), nil
+		}
+	}
+	return nil, fmt.Errorf("invalid Ed25519 private key encoding (expected base64url or hex, 32/64 bytes)")
+}
+
+func loadAgentPassportSigningKey(agentID string) (ed25519.PrivateKey, error) {
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+	if cfg.WalletKeyring == nil {
+		return nil, fmt.Errorf("no wallet keyring found")
+	}
+	keys, ok := cfg.WalletKeyring[agentID]
+	if !ok {
+		return nil, fmt.Errorf("no local key entry for agent %s", agentID)
+	}
+	encoded := strings.TrimSpace(keys.PassportEd25519PrivateKey)
+	if encoded == "" {
+		return nil, fmt.Errorf("no local passport signing key for agent %s", agentID)
+	}
+	key, decodeErr := decodeStoredEd25519PrivateKey(encoded)
+	if decodeErr != nil {
+		return nil, fmt.Errorf("decode passport signing key: %w", decodeErr)
+	}
+	return key, nil
+}
+
+func ensureAgentPassportSigningKey(agentID string) (ed25519.PrivateKey, error) {
+	key, err := loadAgentPassportSigningKey(agentID)
+	if err == nil {
+		return key, nil
+	}
+
+	// Best-effort self-heal: bind and persist a new auth key if none exists locally.
+	warn := autoBindAndIssuePassport(agentID)
+	if warn != "" {
+		return nil, fmt.Errorf("agent passport key unavailable: %s", warn)
+	}
+
+	key, err = loadAgentPassportSigningKey(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("agent passport key unavailable after auto-bind: %w", err)
+	}
+	return key, nil
+}
+
+func buildLoanAcceptTermsProofAt(agentID, loanID string, now time.Time) (map[string]any, error) {
+	signingKey, err := ensureAgentPassportSigningKey(agentID)
+	if err != nil {
+		return nil, err
+	}
+
+	msg := loanNoteAcceptanceMessage{
+		Kind:       "loan_note_acceptance",
+		Version:    "1",
+		LoanID:     loanID,
+		AgentID:    agentID,
+		AcceptedAt: now.UTC().Format(time.RFC3339),
+	}
+	canonicalJSON, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("serialize loan note message: %w", err)
+	}
+	digestData := append([]byte(loanNoteSignatureDomainKey), canonicalJSON...)
+	digest := sha256.Sum256(digestData)
+	sig := ed25519.Sign(signingKey, digest[:])
+
+	return map[string]any{
+		"canonical_loan_note_json": string(canonicalJSON),
+		"message_hash":             base64.RawURLEncoding.EncodeToString(digest[:]),
+		"signature":                base64.RawURLEncoding.EncodeToString(sig),
+	}, nil
+}
+
+func buildLoanAcceptTermsProof(agentID, loanID string) (map[string]any, error) {
+	return buildLoanAcceptTermsProofAt(agentID, loanID, time.Now().UTC())
+}
 
 func autoBindAndIssuePassport(agentID string) string {
 	// Step 1: Generate Ed25519 keypair
@@ -5859,6 +6058,11 @@ func autoBindAndIssuePassport(agentID string) string {
 	})
 	if err != nil {
 		return "passport: auth key verify failed: " + err.Error()
+	}
+
+	// Persist the signing key locally for future loan-note signatures.
+	if err := saveAgentPassportSigningKey(agentID, privKey); err != nil {
+		return "passport: failed to persist auth signing key: " + err.Error()
 	}
 
 	// Step 5: Issue passport
@@ -6047,6 +6251,9 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 		"amount":  amount,
 	})
 	if err != nil {
+		if emitLoanPolicyError("bob loan repay", err, agentID) {
+			return nil
+		}
 		emitError("bob loan repay", err)
 		return nil
 	}
@@ -6229,6 +6436,9 @@ func runLoanAcceptTerms(cmd *cobra.Command, args []string) error {
 		// Auto-find the first pending_terms loan for this agent.
 		resp, err := apiGet("/loans/agreements")
 		if err != nil {
+			if emitLoanPolicyError("bob loan accept-terms", err, agentID) {
+				return nil
+			}
 			emitError("bob loan accept-terms", err)
 			return nil
 		}
@@ -6256,8 +6466,20 @@ func runLoanAcceptTerms(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	resp, err := apiPost(fmt.Sprintf("/loans/agreements/%s/accept-terms", url.PathEscape(loanID)), map[string]any{})
+	proofPayload, err := buildLoanAcceptTermsProof(agentID, loanID)
 	if err != nil {
+		emitErrorWithActions("bob loan accept-terms", fmt.Errorf("failed to prepare loan-note signature proof: %w", err), []NextAction{
+			{Command: "bob init --code <claim-code>", Description: "Initialize and bind a local passport signing key"},
+			{Command: fmt.Sprintf("bob agent passport-issue %s", agentID), Description: "Issue/update passport credential after key binding"},
+		})
+		return nil
+	}
+
+	resp, err := apiPost(fmt.Sprintf("/loans/agreements/%s/accept-terms", url.PathEscape(loanID)), proofPayload)
+	if err != nil {
+		if emitLoanPolicyError("bob loan accept-terms", err, agentID) {
+			return nil
+		}
 		emitError("bob loan accept-terms", err)
 		return nil
 	}
@@ -6310,6 +6532,9 @@ func runLoanRequest(cmd *cobra.Command, args []string) error {
 
 	resp, err := apiPost("/loans/requests", body)
 	if err != nil {
+		if emitLoanPolicyError("bob loan request", err, agentID) {
+			return nil
+		}
 		emitError("bob loan request", err)
 		return nil
 	}
@@ -6366,9 +6591,13 @@ func runLoanRequests(cmd *cobra.Command, args []string) error {
 
 func runLoanRequestCancel(cmd *cobra.Command, args []string) error {
 	requestID := args[0]
+	agentID := resolveAgentID(cmd)
 
 	resp, err := apiDelete(fmt.Sprintf("/loans/requests/%s", url.PathEscape(requestID)))
 	if err != nil {
+		if emitLoanPolicyError("bob loan request-cancel", err, agentID) {
+			return nil
+		}
 		emitError("bob loan request-cancel", err)
 		return nil
 	}

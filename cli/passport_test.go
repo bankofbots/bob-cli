@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 )
 
@@ -94,6 +95,16 @@ func TestPublicKeyBase64Encoding(t *testing.T) {
 }
 
 func TestAutoBindAndIssuePassport_MockServer(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("BOB_CONFIG_FILE", configPath)
+
+	if err := writeCLIConfig(configPath, cliConfig{
+		AgentID:       "test-agent",
+		WalletKeyring: map[string]agentWalletKeys{},
+	}); err != nil {
+		t.Fatalf("writeCLIConfig: %v", err)
+	}
+
 	// Mock API server that handles challenge, verify, and issue
 	challengeCount := 0
 	verifyCount := 0
@@ -169,6 +180,18 @@ func TestAutoBindAndIssuePassport_MockServer(t *testing.T) {
 		t.Fatalf("autoBindAndIssuePassport should succeed, got warning: %s", result)
 	}
 
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		t.Fatalf("loadCLIConfig: %v", err)
+	}
+	keys, ok := cfg.WalletKeyring["test-agent"]
+	if !ok {
+		t.Fatalf("missing keyring entry for test-agent: %#v", cfg.WalletKeyring)
+	}
+	if keys.PassportEd25519PrivateKey == "" {
+		t.Fatal("passport signing key was not persisted")
+	}
+
 	if challengeCount != 1 {
 		t.Errorf("expected 1 challenge call, got %d", challengeCount)
 	}
@@ -181,6 +204,9 @@ func TestAutoBindAndIssuePassport_MockServer(t *testing.T) {
 }
 
 func TestAutoBindAndIssuePassport_ChallengeFailure(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("BOB_CONFIG_FILE", configPath)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"agent not found"}`, 404)
 	}))
@@ -205,6 +231,9 @@ func TestAutoBindAndIssuePassport_ChallengeFailure(t *testing.T) {
 }
 
 func TestAutoBindAndIssuePassport_VerifyFailure(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("BOB_CONFIG_FILE", configPath)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if contains(r.URL.Path, "/auth-key/challenge") {
 			msg := map[string]any{
