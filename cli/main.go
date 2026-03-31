@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.51.0"
+const version = "0.52.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -1437,24 +1437,16 @@ func commandTree() CommandInfo {
 			},
 			{
 				Name:        "loan",
-				Description: "P2P loan marketplace",
+				Description: "Borrow USDC against your BOB Score",
 				Children: []CommandInfo{
-					{Name: "lender-status", Description: "Check if your account is approved for lending", Usage: "bob loan lender-status"},
-					{
-						Name:        "offer create",
-						Description: "Create a loan offer",
-						Usage:       "bob loan offer create --agent-id <id> --safe <addr> --amount <usdc> --rate <bps> --min-score <n> --duration <days>",
-					},
-					{Name: "offer list", Description: "List your loan offers", Usage: "bob loan offer list [--agent-id <id>]"},
-					{Name: "offer get", Description: "Get loan offer details", Usage: "bob loan offer get <offer-id>"},
-					{Name: "offer cancel", Description: "Cancel a loan offer", Usage: "bob loan offer cancel <offer-id>"},
-					{Name: "marketplace", Description: "Browse active loan offers", Usage: "bob loan marketplace [--limit <n>]"},
-					{Name: "accept", Description: "Accept a loan offer", Usage: "bob loan accept <offer-id> --amount <usdc> [--agent-id <id>]"},
-					{Name: "draw", Description: "Record a loan drawdown", Usage: "bob loan draw <loan-id> --tx <hash> [--agent-id <id>]"},
-					{Name: "repay", Description: "Record a loan repayment", Usage: "bob loan repay <loan-id> --tx <hash> --amount <usdc> [--agent-id <id>]"},
+					{Name: "eligibility", Description: "Check if you qualify for a loan", Usage: "bob loan eligibility"},
+					{Name: "request", Description: "Submit a loan request", Usage: "bob loan request --amount <usdc> --duration <days>"},
+					{Name: "requests", Description: "List your loan requests", Usage: "bob loan requests"},
+					{Name: "request-cancel", Description: "Cancel a pending loan request", Usage: "bob loan request-cancel <request-id>"},
+					{Name: "accept-terms", Description: "Sign and accept loan terms", Usage: "bob loan accept-terms [loan-id] [--agent-id <id>]"},
 					{Name: "list", Description: "List your loans", Usage: "bob loan list [--agent-id <id>]"},
 					{Name: "status", Description: "Show loan status", Usage: "bob loan status <loan-id> [--agent-id <id>]"},
-					{Name: "accept-terms", Description: "Sign and accept loan terms", Usage: "bob loan accept-terms [loan-id] [--agent-id <id>]"},
+					{Name: "repay", Description: "Repay a loan", Usage: "bob loan repay <loan-id> --amount <usdc> [--agent-id <id>]"},
 				},
 			},
 			{
@@ -4355,7 +4347,7 @@ func bindingCmd() *cobra.Command {
 	verifyCmd.MarkFlagRequired("rail")
 	verifyCmd.MarkFlagRequired("challenge-id")
 	verifyCmd.MarkFlagRequired("address")
-	// Note: --signature is NOT required — if omitted with --message, auto-signs with local key.
+	// Note: --signature is NOT required — if omitted, auto-signs with local key via server challenge fetch.
 	cmd.AddCommand(verifyCmd)
 
 	// bob binding auto — one-shot bind all local wallets
@@ -5565,9 +5557,10 @@ func walletCmd() *cobra.Command {
 	// bob wallet addresses
 	addressesCmd := &cobra.Command{
 		Use:   "addresses",
-		Short: "Show locally generated wallet addresses (from config)",
+		Short: "Show locally generated wallet addresses for the current agent",
 		RunE:  runWalletAddresses,
 	}
+	addressesCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
 	cmd.AddCommand(addressesCmd)
 
 	// bob wallet provision-check
@@ -5786,27 +5779,53 @@ func runWalletAddresses(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if cfg.EVMAddress == "" && cfg.BTCAddress == "" && cfg.SOLAddress == "" {
-		emitError("bob wallet addresses", fmt.Errorf("no wallet keys found in config — run bob init to generate"))
+	// Use per-agent keyring (correct for multi-agent configs).
+	agentID := resolveAgentID(cmd)
+	explicitAgentID, _ := cmd.Flags().GetString("agent-id")
+	keys := cfg.walletKeysForAgent(agentID)
+
+	// Only fall back to active agent if --agent-id was NOT explicitly provided.
+	// Otherwise we'd silently show the wrong agent's addresses.
+	if keys == nil && strings.TrimSpace(explicitAgentID) == "" {
+		keys = cfg.activeWalletKeys()
+	}
+
+	// Final fallback: legacy flat fields for old configs without keyring.
+	evmAddr := ""
+	btcAddr := ""
+	solAddr := ""
+	if keys != nil {
+		evmAddr = keys.EVMAddress
+		btcAddr = keys.BTCAddress
+		solAddr = keys.SOLAddress
+	} else if strings.TrimSpace(explicitAgentID) == "" {
+		// Only use flat fields when no explicit agent was requested.
+		evmAddr = cfg.EVMAddress
+		btcAddr = cfg.BTCAddress
+		solAddr = cfg.SOLAddress
+	}
+
+	if evmAddr == "" && btcAddr == "" && solAddr == "" {
+		emitError("bob wallet addresses", fmt.Errorf("no wallet keys found for agent %s — run bob init to generate", agentID))
 		return nil
 	}
 
 	addresses := map[string]any{}
-	if cfg.EVMAddress != "" {
+	if evmAddr != "" {
 		addresses["evm"] = map[string]any{
-			"address": cfg.EVMAddress,
+			"address": evmAddr,
 			"chains":  []string{"Ethereum", "Base (USDC)"},
 		}
 	}
-	if cfg.BTCAddress != "" {
+	if btcAddr != "" {
 		addresses["btc"] = map[string]any{
-			"address": cfg.BTCAddress,
+			"address": btcAddr,
 			"chains":  []string{"Bitcoin (bech32)"},
 		}
 	}
-	if cfg.SOLAddress != "" {
+	if solAddr != "" {
 		addresses["solana"] = map[string]any{
-			"address": cfg.SOLAddress,
+			"address": solAddr,
 			"chains":  []string{"Solana"},
 		}
 	}
@@ -5815,6 +5834,7 @@ func runWalletAddresses(cmd *cobra.Command, args []string) error {
 		OK:      true,
 		Command: "bob wallet addresses",
 		Data: map[string]any{
+			"agent_id":    agentID,
 			"config_file": activeCLIConfigPath(),
 			"addresses":   addresses,
 		},
@@ -5936,15 +5956,28 @@ func handleWalletProvisionCommand(agentID, commandID, payloadStr string) (map[st
 		return nil, fmt.Errorf("payload missing rail field")
 	}
 
-	// Load local address for this rail
+	// Load local address for this rail (per-agent keyring, fallback to legacy flat fields).
 	cfg, cfgErr := loadCLIConfig()
 	if cfgErr != nil {
 		return nil, fmt.Errorf("failed to load config: %w", cfgErr)
 	}
-	addrMap := map[string]string{
-		"evm":    cfg.EVMAddress,
-		"btc":    cfg.BTCAddress,
-		"solana": cfg.SOLAddress,
+	keys := cfg.walletKeysForAgent(agentID)
+	if keys == nil {
+		keys = cfg.activeWalletKeys()
+	}
+	var addrMap map[string]string
+	if keys != nil {
+		addrMap = map[string]string{
+			"evm":    keys.EVMAddress,
+			"btc":    keys.BTCAddress,
+			"solana": keys.SOLAddress,
+		}
+	} else {
+		addrMap = map[string]string{
+			"evm":    cfg.EVMAddress,
+			"btc":    cfg.BTCAddress,
+			"solana": cfg.SOLAddress,
+		}
 	}
 	addr := addrMap[payload.Rail]
 	if addr == "" {
@@ -6435,9 +6468,12 @@ func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string
 	if loadErr != nil {
 		return "", 0, fmt.Errorf("load config: %w", loadErr)
 	}
-	keys := cfg.activeWalletKeys()
+	keys := cfg.walletKeysForAgent(agentID)
+	if keys == nil {
+		keys = cfg.activeWalletKeys()
+	}
 	if keys == nil || keys.EVMPrivateKey == "" {
-		return "", 0, fmt.Errorf("no EVM wallet key found — run 'bob init' first")
+		return "", 0, fmt.Errorf("no EVM wallet key found for agent %s — run 'bob init' first", agentID)
 	}
 
 	// 3. Execute the on-chain USDC transfer via Safe (or direct EOA fallback).
@@ -6491,7 +6527,7 @@ func runLoanList(cmd *cobra.Command, args []string) error {
 		},
 		NextActions: []NextAction{
 			{Command: "bob loan status <loan-id> --agent-id " + agentID, Description: "View loan details"},
-			{Command: "bob loan marketplace", Description: "Browse available offers"},
+			{Command: "bob loan eligibility", Description: "Check borrowing eligibility"},
 		},
 	})
 	return nil
@@ -6607,7 +6643,7 @@ func runLoanAcceptTerms(cmd *cobra.Command, args []string) error {
 		},
 		NextActions: []NextAction{
 			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check loan status"},
-			{Command: "bob loan draw " + loanID + " --tx <hash> --agent-id " + agentID, Description: "Record funding draw"},
+			{Command: "bob wallet balance --agent-id " + agentID, Description: "Check wallet balance"},
 		},
 	})
 	return nil

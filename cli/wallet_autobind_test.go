@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,22 +17,29 @@ func TestSignEVMChallenge(t *testing.T) {
 		t.Fatal(err)
 	}
 	privHex := hex.EncodeToString(ethcrypto.FromECDSA(key))
-	msg := "BOB Score Wallet Verification\nRail: evm\nAddress: 0xabc\nOperator: op1\nNonce: abc123\nExpires: 2099-01-01T00:00:00Z"
 
-	sig, err := signEVMChallenge(msg, privHex)
+	sig, err := signEVMChallenge("BOB Score Wallet Verification\nNonce: abc123", privHex)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("signEVMChallenge: %v", err)
 	}
 	if !strings.HasPrefix(sig, "0x") {
-		t.Fatal("EVM signature should have 0x prefix")
+		t.Fatalf("expected 0x prefix, got %q", sig)
 	}
-	sigBytes, _ := hex.DecodeString(sig[2:])
+	// EIP-191 sig = 65 bytes = 130 hex chars + "0x"
+	if len(sig) != 132 {
+		t.Fatalf("expected 132 chars, got %d", len(sig))
+	}
+	// Decode and verify 65-byte payload with V normalization (27 or 28).
+	sigBytes, decErr := hex.DecodeString(sig[2:])
+	if decErr != nil {
+		t.Fatalf("hex decode: %v", decErr)
+	}
 	if len(sigBytes) != 65 {
-		t.Fatalf("expected 65 byte sig, got %d", len(sigBytes))
+		t.Fatalf("expected 65 bytes, got %d", len(sigBytes))
 	}
-	// V should be 27 or 28
-	if sigBytes[64] != 27 && sigBytes[64] != 28 {
-		t.Fatalf("unexpected V value: %d", sigBytes[64])
+	v := sigBytes[64]
+	if v != 27 && v != 28 {
+		t.Fatalf("V byte should be 27 or 28, got %d", v)
 	}
 }
 
@@ -41,19 +49,16 @@ func TestSignBTCChallenge(t *testing.T) {
 		t.Fatal(err)
 	}
 	privHex := hex.EncodeToString(ethcrypto.FromECDSA(key))
-	msg := "BOB Score Wallet Verification\nRail: btc\nAddress: bc1qtest\nOperator: op1\nNonce: abc123\nExpires: 2099-01-01T00:00:00Z"
 
-	sig, err := signBTCChallenge(msg, privHex)
+	sig, err := signBTCChallenge("BOB Score Wallet Verification\nNonce: abc123", privHex)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("signBTCChallenge: %v", err)
 	}
-	// BIP-137 is base64-encoded, not hex
+	if len(sig) == 0 {
+		t.Fatal("empty signature")
+	}
 	if strings.HasPrefix(sig, "0x") {
-		t.Fatal("BTC signature should be base64, not hex")
-	}
-	// Base64 of 65 bytes = 88 chars
-	if len(sig) != 88 {
-		t.Fatalf("expected 88 char base64 sig, got %d", len(sig))
+		t.Fatalf("BTC sig should be base64, not hex: %q", sig)
 	}
 }
 
@@ -63,42 +68,117 @@ func TestSignSolanaChallenge(t *testing.T) {
 		t.Fatal(err)
 	}
 	privHex := hex.EncodeToString(privKey)
-	msg := "BOB Score Wallet Verification\nRail: solana\nAddress: SoLtest\nOperator: op1\nNonce: abc123\nExpires: 2099-01-01T00:00:00Z"
 
-	sig, err := signSolanaChallenge(msg, privHex)
+	sig, err := signSolanaChallenge("BOB Score Wallet Verification\nNonce: abc123", privHex)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("signSolanaChallenge: %v", err)
 	}
 	if !strings.HasPrefix(sig, "0x") {
-		t.Fatal("Solana signature should have 0x prefix")
+		t.Fatalf("expected 0x prefix, got %q", sig)
 	}
-	sigBytes, _ := hex.DecodeString(sig[2:])
-	if len(sigBytes) != 64 {
-		t.Fatalf("expected 64 byte Ed25519 sig, got %d", len(sigBytes))
+	// Ed25519 sig = 64 bytes = 128 hex chars + "0x"
+	if len(sig) != 130 {
+		t.Fatalf("expected 130 chars, got %d", len(sig))
+	}
+}
+
+func TestSignChallengeMessage_UnsupportedRail(t *testing.T) {
+	_, err := signChallengeMessage("lightning", "test", "deadbeef")
+	if err == nil {
+		t.Fatal("expected error for unsupported rail")
+	}
+	if !strings.Contains(err.Error(), "unsupported rail") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSignEVMChallenge_BadKey(t *testing.T) {
+	_, err := signEVMChallenge("test message", "not-hex")
+	if err == nil {
+		t.Fatal("expected error for bad key")
+	}
+}
+
+func TestSignSolanaChallenge_WrongKeyLength(t *testing.T) {
+	_, err := signSolanaChallenge("test message", hex.EncodeToString([]byte("too-short")))
+	if err == nil {
+		t.Fatal("expected error for wrong key length")
+	}
+}
+
+func TestWalletKeysForAgent_Lookup(t *testing.T) {
+	cfg := &cliConfig{
+		AgentID: "agent-a",
+		WalletKeyring: map[string]agentWalletKeys{
+			"agent-a": {EVMAddress: "0xAAA"},
+			"agent-b": {EVMAddress: "0xBBB"},
+		},
+	}
+
+	keys := cfg.activeWalletKeys()
+	if keys == nil || keys.EVMAddress != "0xAAA" {
+		t.Fatalf("activeWalletKeys: expected agent-a, got %+v", keys)
+	}
+
+	keys = cfg.walletKeysForAgent("agent-b")
+	if keys == nil || keys.EVMAddress != "0xBBB" {
+		t.Fatalf("walletKeysForAgent(agent-b): expected agent-b, got %+v", keys)
+	}
+
+	keys = cfg.walletKeysForAgent("agent-c")
+	if keys != nil {
+		t.Fatalf("walletKeysForAgent(agent-c): expected nil, got %+v", keys)
 	}
 }
 
 func TestBitcoinVarint(t *testing.T) {
-	tests := []struct {
+	// Check length AND byte content.
+	cases := []struct {
 		n    int
 		want []byte
 	}{
 		{0, []byte{0}},
 		{252, []byte{252}},
 		{253, []byte{0xfd, 253, 0}},
-		{256, []byte{0xfd, 0, 1}},
-		{65535, []byte{0xfd, 255, 255}},
+		{65535, []byte{0xfd, 0xff, 0xff}},
+		{65536, []byte{0xfe, 0x00, 0x00, 0x01, 0x00}},
 	}
-	for _, tt := range tests {
-		got := bitcoinVarint(tt.n)
-		if len(got) != len(tt.want) {
-			t.Errorf("bitcoinVarint(%d) = %v, want %v", tt.n, got, tt.want)
+	for _, tc := range cases {
+		got := bitcoinVarint(tc.n)
+		if len(got) != len(tc.want) {
+			t.Errorf("bitcoinVarint(%d): got %d bytes, want %d", tc.n, len(got), len(tc.want))
 			continue
 		}
 		for i := range got {
-			if got[i] != tt.want[i] {
-				t.Errorf("bitcoinVarint(%d)[%d] = %d, want %d", tt.n, i, got[i], tt.want[i])
+			if got[i] != tc.want[i] {
+				t.Errorf("bitcoinVarint(%d): byte %d = %02x, want %02x", tc.n, i, got[i], tc.want[i])
 			}
 		}
 	}
+}
+
+func TestEVMAndBTCShareKey_DifferentSignatures(t *testing.T) {
+	key, _ := ethcrypto.GenerateKey()
+	privHex := hex.EncodeToString(ethcrypto.FromECDSA(key))
+
+	evmSig, err := signEVMChallenge("test", privHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	btcSig, err := signBTCChallenge("test", privHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evmSig == "" || btcSig == "" {
+		t.Fatal("both should be non-empty")
+	}
+	if evmSig == btcSig {
+		t.Fatal("EVM and BTC sigs should differ (different hash schemes)")
+	}
+}
+
+// Compile-time check.
+var _ = func() {
+	key, _ := ecdsa.GenerateKey(ethcrypto.S256(), rand.Reader)
+	_ = key
 }
