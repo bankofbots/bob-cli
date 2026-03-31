@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.52.1"
+const version = "0.52.2"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -92,20 +92,17 @@ type cliConfig struct {
 }
 
 // migrateWalletKeyring moves legacy flat wallet keys into the per-agent keyring.
+// Only runs ONCE: when WalletKeyring is nil (truly legacy config from before
+// per-agent keyring was introduced). Once the keyring exists, new agents must
+// generate their own keys — we never copy flat fields into new agent entries.
 func (c *cliConfig) migrateWalletKeyring() {
-	if c.EVMAddress == "" {
+	if c.EVMAddress == "" || c.WalletKeyring != nil {
 		return
 	}
-	if c.WalletKeyring == nil {
-		c.WalletKeyring = make(map[string]agentWalletKeys)
-	}
+	c.WalletKeyring = make(map[string]agentWalletKeys)
 	agentID := c.AgentID
 	if agentID == "" {
 		agentID = "_unknown"
-		fmt.Fprintf(os.Stderr, "warning: migrating wallet keys with no agent_id — storing under '_unknown' bucket. Run 'bob init' to associate with an agent.\n")
-	}
-	if _, exists := c.WalletKeyring[agentID]; exists {
-		return
 	}
 	c.WalletKeyring[agentID] = agentWalletKeys{
 		EVMPrivateKey: c.EVMPrivateKey, EVMAddress: c.EVMAddress,

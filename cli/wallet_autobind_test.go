@@ -211,3 +211,73 @@ func TestGenerateWalletKeys_UniquePerCall(t *testing.T) {
 		t.Fatal("two calls produced same SOL private key")
 	}
 }
+
+// Test that migrateWalletKeyring only runs once (when keyring is nil),
+// and does NOT copy flat fields into new agent entries.
+func TestMigrateWalletKeyring_OnlyRunsOnce(t *testing.T) {
+	// Simulate legacy config: flat fields set, no keyring.
+	cfg := &cliConfig{
+		AgentID:       "agent-old",
+		EVMAddress:    "0xOLD",
+		EVMPrivateKey: "oldkey",
+		BTCAddress:    "bc1old",
+		BTCPrivateKey: "oldkey",
+		SOLAddress:    "SOLold",
+		SOLPrivateKey: "oldsolkey",
+	}
+
+	// First migration: should create keyring with old agent's keys.
+	cfg.migrateWalletKeyring()
+	if cfg.WalletKeyring == nil {
+		t.Fatal("expected keyring to be created")
+	}
+	keys := cfg.WalletKeyring["agent-old"]
+	if keys.EVMAddress != "0xOLD" {
+		t.Fatalf("expected 0xOLD, got %s", keys.EVMAddress)
+	}
+
+	// Now simulate a new agent being created (agent_id changes).
+	cfg.AgentID = "agent-new"
+
+	// Second migration: keyring already exists, should NOT create entry for new agent.
+	cfg.migrateWalletKeyring()
+
+	if _, exists := cfg.WalletKeyring["agent-new"]; exists {
+		t.Fatal("migrateWalletKeyring should NOT auto-populate new agent entries from flat fields")
+	}
+
+	// Old agent's keys should still be there.
+	if cfg.WalletKeyring["agent-old"].EVMAddress != "0xOLD" {
+		t.Fatal("old agent keys should be preserved")
+	}
+}
+
+// Test that legacy config without keyring gets properly migrated.
+func TestMigrateWalletKeyring_LegacyConfig(t *testing.T) {
+	cfg := &cliConfig{
+		AgentID:       "legacy-agent",
+		EVMAddress:    "0xLEGACY",
+		EVMPrivateKey: "legacykey",
+	}
+
+	cfg.migrateWalletKeyring()
+
+	if cfg.WalletKeyring == nil {
+		t.Fatal("expected keyring to be created for legacy config")
+	}
+	keys := cfg.WalletKeyring["legacy-agent"]
+	if keys.EVMAddress != "0xLEGACY" {
+		t.Fatalf("expected 0xLEGACY, got %s", keys.EVMAddress)
+	}
+}
+
+// Test that migration is skipped when flat fields are empty.
+func TestMigrateWalletKeyring_NoFlatFields(t *testing.T) {
+	cfg := &cliConfig{AgentID: "agent-1"}
+
+	cfg.migrateWalletKeyring()
+
+	if cfg.WalletKeyring != nil {
+		t.Fatal("should not create keyring when no flat fields exist")
+	}
+}
