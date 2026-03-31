@@ -182,3 +182,32 @@ var _ = func() {
 	key, _ := ecdsa.GenerateKey(ethcrypto.S256(), rand.Reader)
 	_ = key
 }
+
+// Regression: each call to generateWalletKeys must produce unique addresses.
+// This prevents reintroduction of cross-agent key reuse.
+func TestGenerateWalletKeys_UniquePerCall(t *testing.T) {
+	keys1, err := generateWalletKeys("bc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys2, err := generateWalletKeys("bc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if keys1.EVMAddress == keys2.EVMAddress {
+		t.Fatalf("two calls produced same EVM address: %s", keys1.EVMAddress)
+	}
+	if keys1.BTCAddress == keys2.BTCAddress {
+		t.Fatalf("two calls produced same BTC address: %s", keys1.BTCAddress)
+	}
+	if keys1.SOLAddress == keys2.SOLAddress {
+		t.Fatalf("two calls produced same SOL address: %s", keys1.SOLAddress)
+	}
+	if keys1.EVMPrivateKey == keys2.EVMPrivateKey {
+		t.Fatal("two calls produced same EVM private key")
+	}
+	if keys1.SOLPrivateKey == keys2.SOLPrivateKey {
+		t.Fatal("two calls produced same SOL private key")
+	}
+}

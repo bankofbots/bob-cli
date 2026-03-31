@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.52.0"
+const version = "0.52.1"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -5204,62 +5204,8 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		}
 	}
 
-	// Try to migrate wallet keys from a previous agent in the keyring.
-	// Only fall through to fresh keys on ownership conflicts (409 with different
-	// operator). Transient errors (401, 500, network) keep the migrated keys.
-	if migrated := migrateWalletKeys(&cfg, agentID); migrated != nil {
-		if writeErr := writeCLIConfig(cliConfigPath(), cfg); writeErr != nil {
-			return walletInitResult{err: "wallet: failed to save migrated keys: " + writeErr.Error()}
-		}
-
-		// Test EVM registration first (don't register BTC/SOL yet).
-		// If EVM fails due to ownership conflict, abandon migration for ALL rails
-		// to keep local and server state in sync.
-		evmWarn := registerWalletBestEffort(agentID, "evm", migrated.EVMAddress)
-
-		isOwnershipConflict := evmWarn != "" &&
-			(strings.Contains(evmWarn, "409") || strings.Contains(evmWarn, "403")) &&
-			!strings.Contains(evmWarn, "already registered for this agent")
-
-		if isOwnershipConflict {
-			fmt.Fprintf(os.Stderr, "  migrated EVM wallet rejected (address belongs to another agent) — generating fresh keys\n")
-			fmt.Fprintf(os.Stderr, "  old keys preserved in keyring (funds at %s are still accessible)\n", migrated.EVMAddress)
-			// Backup with timestamp to avoid overwriting previous backups.
-			backupKey := fmt.Sprintf("_backup_%s_%d", agentID, time.Now().Unix())
-			if old, ok := cfg.WalletKeyring[agentID]; ok {
-				cfg.WalletKeyring[backupKey] = old
-				delete(cfg.WalletKeyring, agentID)
-			}
-			_ = writeCLIConfig(cliConfigPath(), cfg)
-			// Fall through to fresh key generation below.
-		} else {
-			// EVM succeeded or had a non-ownership error — proceed with BTC/SOL.
-			btcWarn := registerWalletBestEffort(agentID, "btc", migrated.BTCAddress)
-			solWarn := registerWalletBestEffort(agentID, "solana", migrated.SOLAddress)
-
-			var regWarnings []string
-			if evmWarn != "" {
-				regWarnings = append(regWarnings, evmWarn)
-			}
-			if btcWarn != "" {
-				regWarnings = append(regWarnings, btcWarn)
-			}
-			if solWarn != "" {
-				regWarnings = append(regWarnings, solWarn)
-			}
-			result := walletInitResult{
-				evmAddress: migrated.EVMAddress,
-				btcAddress: migrated.BTCAddress,
-				solAddress: migrated.SOLAddress,
-			}
-			if len(regWarnings) > 0 {
-				result.err = "wallet registration: " + strings.Join(regWarnings, "; ")
-			}
-			return result
-		}
-	}
-
-	// New agent or first init — generate fresh keys.
+	// Always generate fresh keys for each new agent.
+	// Old agent keys are preserved in the keyring and never lost.
 	// Old agent keys stay in the keyring and are never lost.
 	btcHRP := "bc"
 	loweredBase := strings.ToLower(apiBase)
@@ -5321,71 +5267,6 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 	return result
 }
 
-// migrateWalletKeys finds wallet keys from a previous agent in the keyring and
-// migrates them to the new agent ID. Returns the migrated keys or nil if none found.
-// Cleans up the old keyring entry to prevent re-migration.
-func migrateWalletKeys(cfg *cliConfig, newAgentID string) *agentWalletKeys {
-	if cfg.WalletKeyring == nil {
-		return nil
-	}
-
-	// Find the best candidate: pick the most recent entry (highest ID lexically).
-	// In practice there's usually only one other entry.
-	var bestID string
-	var bestKeys agentWalletKeys
-	for oldID, oldKeys := range cfg.WalletKeyring {
-		if oldID == newAgentID || oldKeys.EVMAddress == "" || strings.HasPrefix(oldID, "_backup_") {
-			continue
-		}
-		if bestID == "" || oldID > bestID {
-			bestID = oldID
-			bestKeys = oldKeys
-		}
-	}
-	if bestID == "" {
-		return nil
-	}
-
-	// Check if the BTC address prefix matches the current environment.
-	// If the old agent was pointing at a different network (e.g. localhost/regtest),
-	// the BTC address will have the wrong prefix and can never bind on the current network.
-	expectedHRP := "bc"
-	loweredBase := strings.ToLower(apiBase)
-	if strings.Contains(loweredBase, "localhost") || strings.Contains(loweredBase, "127.0.0.1") {
-		expectedHRP = "bcrt"
-	} else if strings.Contains(loweredBase, "testnet") {
-		expectedHRP = "tb"
-	}
-
-	if bestKeys.BTCAddress != "" && !strings.HasPrefix(bestKeys.BTCAddress, expectedHRP+"1") {
-		newAddr, err := rederiveBTCAddress(bestKeys.BTCPrivateKey, expectedHRP)
-		if err == nil {
-			fmt.Fprintf(os.Stderr, "\n  ⚠ BTC ADDRESS PREFIX MISMATCH: old %s does not match expected prefix %q for current API\n", bestKeys.BTCAddress, expectedHRP)
-			fmt.Fprintf(os.Stderr, "    Regenerated BTC address: %s\n", newAddr)
-			bestKeys.BTCAddress = newAddr
-		} else {
-			fmt.Fprintf(os.Stderr, "\n  ⚠ BTC ADDRESS PREFIX MISMATCH: old %s (expected %q), but re-derivation failed: %v\n", bestKeys.BTCAddress, expectedHRP, err)
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "\n  ⚠ WALLET KEY MIGRATION: reusing keys from agent %s for new agent %s\n", bestID, newAgentID)
-	fmt.Fprintf(os.Stderr, "    EVM: %s | BTC: %s | SOL: %s\n", bestKeys.EVMAddress, bestKeys.BTCAddress, bestKeys.SOLAddress)
-	fmt.Fprintf(os.Stderr, "    If the previous agent was compromised, delete ~/.config/bob/config.json and re-run bob init.\n\n")
-
-	// Copy to new agent, remove old entry
-	cfg.WalletKeyring[newAgentID] = bestKeys
-	delete(cfg.WalletKeyring, bestID)
-
-	// Update legacy flat fields
-	cfg.EVMPrivateKey = bestKeys.EVMPrivateKey
-	cfg.EVMAddress = bestKeys.EVMAddress
-	cfg.BTCPrivateKey = bestKeys.BTCPrivateKey
-	cfg.BTCAddress = bestKeys.BTCAddress
-	cfg.SOLPrivateKey = bestKeys.SOLPrivateKey
-	cfg.SOLAddress = bestKeys.SOLAddress
-
-	return &bestKeys
-}
 
 // walletRegistrationMessage returns the deterministic message that must be
 // signed to prove private key ownership during wallet registration.
