@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -166,10 +167,42 @@ func TestRunLoanAcceptTerms_SendsSignatureProof(t *testing.T) {
 		t.Fatalf("set agent-id flag: %v", err)
 	}
 
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
 	if err := runLoanAcceptTerms(cmd, nil); err != nil {
 		t.Fatalf("runLoanAcceptTerms: %v", err)
 	}
+	_ = w.Close()
+	os.Stdout = oldStdout
+
+	var env Envelope
+	if err := json.NewDecoder(r).Decode(&env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	_ = r.Close()
+
 	if !postSeen {
 		t.Fatal("accept-terms POST was not called")
+	}
+	if !env.OK {
+		t.Fatalf("expected ok envelope, got %#v", env)
+	}
+	data, ok := env.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected data shape: %#v", env.Data)
+	}
+	if got := data["message"]; got != "Loan terms accepted. Agent signature recorded. Funding is still pending." {
+		t.Fatalf("unexpected message: %#v", got)
+	}
+	if len(env.NextActions) < 3 {
+		t.Fatalf("expected pending-funding next actions, got %#v", env.NextActions)
+	}
+	if env.NextActions[2].Command != "Fund your borrower wallet with ETH on Base (chain ID 8453) for future repayment gas" {
+		t.Fatalf("unexpected gas next action: %#v", env.NextActions[2])
 	}
 }

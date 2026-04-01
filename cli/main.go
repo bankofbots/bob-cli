@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.52.5"
+const version = "0.52.6"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -347,6 +347,32 @@ func emit(env Envelope) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	enc.Encode(env)
+}
+
+func isBaseChainID(chainID string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(chainID))
+	return normalized == "8453" || normalized == "0x2105" || normalized == "eip155:8453"
+}
+
+func loanRepaymentGasHint(chainID, borrowerWallet string) string {
+	if strings.TrimSpace(borrowerWallet) == "" {
+		return "fund the borrower wallet with the chain's native gas token before retrying repayment"
+	}
+	if isBaseChainID(chainID) {
+		return fmt.Sprintf("fund %s with ETH on Base (chain ID 8453) for gas, then retry repayment", borrowerWallet)
+	}
+	return fmt.Sprintf("fund %s with the native gas token for chain %s, then retry repayment", borrowerWallet, chainID)
+}
+
+func annotateLoanRepaymentError(err error, chainID, borrowerWallet string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "insufficient funds for gas") {
+		return fmt.Errorf("%s: %s", msg, loanRepaymentGasHint(chainID, borrowerWallet))
+	}
+	return err
 }
 
 func emitError(command string, err error) {
@@ -2060,6 +2086,9 @@ func initSession(cmd *cobra.Command, args []string) error {
 			"btc_address": walletResult.btcAddress,
 			"sol_address": walletResult.solAddress,
 		}
+	}
+	if len(walletResult.warnings) > 0 {
+		warnings = append(warnings, walletResult.warnings...)
 	}
 
 	// Auto-bind wallets via operator challenge/verify (best-effort).
@@ -5173,6 +5202,7 @@ type walletInitResult struct {
 	btcAddress string
 	solAddress string
 	err        string
+	warnings   []string
 }
 
 func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
@@ -5269,12 +5299,15 @@ func autoGenerateAndRegisterWallets(agentID string) walletInitResult {
 		btcAddress: keys.BTCAddress,
 		solAddress: keys.SOLAddress,
 	}
+	if loadErr == nil && len(cfg.WalletKeyring) > 0 {
+		result.warnings = append(result.warnings,
+			"generated a fresh wallet set for this agent; wallet keys from older agents stay in the local keyring and are not reused automatically")
+	}
 	if len(regWarnings) > 0 {
 		result.err = "wallet registration: " + strings.Join(regWarnings, "; ")
 	}
 	return result
 }
-
 
 // walletRegistrationMessage returns the deterministic message that must be
 // signed to prove private key ownership during wallet registration.
@@ -6319,9 +6352,9 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 	}
 
 	emit(Envelope{
-		OK:      true,
-		Command: "bob loan repay",
-		Data:    result,
+		OK:          true,
+		Command:     "bob loan repay",
+		Data:        result,
 		NextActions: nextActions,
 	})
 	return nil
@@ -6400,7 +6433,7 @@ func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string
 
 	hash, err := evmRepayLoan(ctx, keys.EVMPrivateKey, loan.ChainID, borrowerWallet, lenderSafe, amount)
 	if err != nil {
-		return "", 0, fmt.Errorf("on-chain transfer failed: %w", err)
+		return "", 0, annotateLoanRepaymentError(fmt.Errorf("on-chain transfer failed: %w", err), loan.ChainID, loan.BorrowerWallet)
 	}
 
 	return hash.Hex(), repayAmount, nil
@@ -6550,14 +6583,48 @@ func runLoanAcceptTerms(cmd *cobra.Command, args []string) error {
 		Data: map[string]any{
 			"loan_id": loanID,
 			"result":  result,
-			"message": "Loan terms accepted. Agent signature recorded.",
+			"message": loanAcceptTermsMessage(result),
 		},
-		NextActions: []NextAction{
-			{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check loan status"},
-			{Command: "bob wallet balance --agent-id " + agentID, Description: "Check wallet balance"},
-		},
+		NextActions: loanAcceptTermsNextActions(agentID, loanID, result),
 	})
 	return nil
+}
+
+func loanAcceptTermsMessage(result json.RawMessage) string {
+	status := ""
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err == nil {
+		if s, ok := parsed["status"].(string); ok {
+			status = strings.TrimSpace(s)
+		}
+	}
+	if status == "pending_funding" {
+		return "Loan terms accepted. Agent signature recorded. Funding is still pending."
+	}
+	return "Loan terms accepted. Agent signature recorded."
+}
+
+func loanAcceptTermsNextActions(agentID, loanID string, result json.RawMessage) []NextAction {
+	status := ""
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err == nil {
+		if s, ok := parsed["status"].(string); ok {
+			status = strings.TrimSpace(s)
+		}
+	}
+
+	actions := []NextAction{
+		{Command: "bob loan status " + loanID + " --agent-id " + agentID, Description: "Check loan status"},
+	}
+	if status == "pending_funding" {
+		actions = append(actions,
+			NextAction{Command: "bob wallet balance --agent-id " + agentID, Description: "Check whether the borrower wallet received loan funds"},
+			NextAction{Command: "Fund your borrower wallet with ETH on Base (chain ID 8453) for future repayment gas", Description: "Repaying an active Base loan requires a small ETH balance for gas"},
+		)
+		return actions
+	}
+	actions = append(actions, NextAction{Command: "bob wallet balance --agent-id " + agentID, Description: "Check wallet balance"})
+	return actions
 }
 
 func runLoanRequest(cmd *cobra.Command, args []string) error {
