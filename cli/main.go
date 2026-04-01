@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.52.4"
+const version = "0.52.5"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -2905,13 +2905,20 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	defaultCurrency := ""
+	var allowedCurrencies map[string]bool
 	switch proofType {
 	case "btc_onchain_tx":
 		defaultCurrency = "BTC"
-	case "eth_onchain_tx", "base_onchain_tx":
+		allowedCurrencies = map[string]bool{"BTC": true}
+	case "eth_onchain_tx":
 		defaultCurrency = "ETH"
+		allowedCurrencies = map[string]bool{"ETH": true}
+	case "base_onchain_tx":
+		defaultCurrency = "ETH"
+		allowedCurrencies = map[string]bool{"ETH": true, "USDC": true}
 	case "sol_onchain_tx":
 		defaultCurrency = "SOL"
+		allowedCurrencies = map[string]bool{"SOL": true}
 	default:
 		emitError("bob agent credit-import", fmt.Errorf("proof-type must be btc_onchain_tx, eth_onchain_tx, base_onchain_tx, or sol_onchain_tx"))
 		return nil
@@ -2928,8 +2935,12 @@ func agentCreditImport(cmd *cobra.Command, args []string) error {
 	if currency == "" {
 		currency = defaultCurrency
 	}
-	if currency != defaultCurrency {
-		emitError("bob agent credit-import", fmt.Errorf("currency must be %s for %s", defaultCurrency, proofType))
+	if !allowedCurrencies[currency] {
+		keys := make([]string, 0, len(allowedCurrencies))
+		for k := range allowedCurrencies {
+			keys = append(keys, k)
+		}
+		emitError("bob agent credit-import", fmt.Errorf("currency must be one of %v for %s", keys, proofType))
 		return nil
 	}
 	if amount <= 0 {
