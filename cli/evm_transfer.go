@@ -17,6 +17,9 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
+var evmBalanceAt = evmNativeBalance
+var evmSendNativeValue = evmSendNative
+
 // chainConfig holds per-chain token addresses and fallback RPC URLs.
 type chainConfig struct {
 	USDCAddress common.Address
@@ -177,15 +180,15 @@ func encodeSafeExecTransaction(to common.Address, data []byte, owner common.Addr
 	// 10 fixed params, then dynamic data + signatures.
 	params := make([]byte, 0, 1024)
 
-	params = append(params, common.LeftPadBytes(to.Bytes(), 32)...)     // to
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // value = 0
+	params = append(params, common.LeftPadBytes(to.Bytes(), 32)...)              // to
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // value = 0
 	params = append(params, common.LeftPadBytes(big.NewInt(320).Bytes(), 32)...) // data offset (10*32)
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // operation = CALL
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // safeTxGas = 0
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // baseGas = 0
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // gasPrice = 0
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // gasToken = 0
-	params = append(params, common.LeftPadBytes(nil, 32)...)            // refundReceiver = 0
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // operation = CALL
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // safeTxGas = 0
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // baseGas = 0
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // gasPrice = 0
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // gasToken = 0
+	params = append(params, common.LeftPadBytes(nil, 32)...)                     // refundReceiver = 0
 
 	dataPadded := padTo32(len(data))
 	sigOffset := 320 + 32 + dataPadded
@@ -230,6 +233,10 @@ func encodeERC20TransferCall(to common.Address, amount *big.Int) []byte {
 // signAndSend builds, signs, broadcasts an EIP-1559 transaction, and waits
 // for on-chain confirmation. Returns the tx hash only on success.
 func signAndSend(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, to common.Address, data []byte) (common.Hash, error) {
+	return signAndSendValue(ctx, client, key, chainID, to, big.NewInt(0), data)
+}
+
+func signAndSendValue(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, to common.Address, value *big.Int, data []byte) (common.Hash, error) {
 	from := ethcrypto.PubkeyToAddress(key.PublicKey)
 
 	nonce, err := client.PendingNonceAt(ctx, from)
@@ -239,9 +246,10 @@ func signAndSend(ctx context.Context, client *ethclient.Client, key *ecdsa.Priva
 
 	// Gas estimation with buffer.
 	estimatedGas, err := client.EstimateGas(ctx, ethereum.CallMsg{
-		From: from,
-		To:   &to,
-		Data: data,
+		From:  from,
+		To:    &to,
+		Value: value,
+		Data:  data,
 	})
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("estimate gas (tx will likely revert): %w", err)
@@ -271,7 +279,7 @@ func signAndSend(ctx context.Context, client *ethclient.Client, key *ecdsa.Priva
 		GasFeeCap: gasFeeCap,
 		Gas:       gasLimit,
 		To:        &to,
-		Value:     big.NewInt(0),
+		Value:     value,
 		Data:      data,
 	})
 
@@ -304,4 +312,52 @@ func signAndSend(ctx context.Context, client *ethclient.Client, key *ecdsa.Priva
 	}
 
 	return common.Hash{}, fmt.Errorf("transaction broadcast but not confirmed within 90s (tx: %s) — do NOT retry, check block explorer first", txHash.Hex())
+}
+
+func evmNativeBalance(ctx context.Context, chainIDHex string, addr common.Address) (*big.Int, error) {
+	rpcURL, err := rpcURLForChain(chainIDHex)
+	if err != nil {
+		return nil, err
+	}
+	client, err := ethclient.DialContext(ctx, rpcURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect to %s: %w", rpcURL, err)
+	}
+	defer client.Close()
+	balance, err := client.BalanceAt(ctx, addr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("read balance: %w", err)
+	}
+	return balance, nil
+}
+
+func evmSendNative(ctx context.Context, privKeyHex string, chainIDHex string, to common.Address, amountWei *big.Int) (common.Hash, error) {
+	if amountWei == nil || amountWei.Sign() <= 0 {
+		return common.Hash{}, fmt.Errorf("amountWei must be positive")
+	}
+
+	rpcURL, err := rpcURLForChain(chainIDHex)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	privKeyBytes, err := hex.DecodeString(strings.TrimPrefix(privKeyHex, "0x"))
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("decode private key: %w", err)
+	}
+	ecKey, err := ethcrypto.ToECDSA(privKeyBytes)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("parse private key: %w", err)
+	}
+	client, err := ethclient.DialContext(ctx, rpcURL)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("connect to %s: %w", rpcURL, err)
+	}
+	defer client.Close()
+
+	chainID, ok := new(big.Int).SetString(strings.TrimPrefix(chainIDHex, "0x"), 16)
+	if !ok {
+		return common.Hash{}, fmt.Errorf("parse chain ID: %s", chainIDHex)
+	}
+
+	return signAndSendValue(ctx, client, ecKey, chainID, to, amountWei, nil)
 }

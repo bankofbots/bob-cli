@@ -25,7 +25,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.52.6"
+const version = "0.53.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -354,12 +354,24 @@ func isBaseChainID(chainID string) bool {
 	return normalized == "8453" || normalized == "0x2105" || normalized == "eip155:8453"
 }
 
+func normalizeChainIDHex(chainID string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(chainID))
+	switch normalized {
+	case "0x2105", "8453", "eip155:8453":
+		return "0x2105", nil
+	case "":
+		return "", fmt.Errorf("missing chain ID")
+	default:
+		return "", fmt.Errorf("unsupported chain ID %q", chainID)
+	}
+}
+
 func loanRepaymentGasHint(chainID, borrowerWallet string) string {
 	if strings.TrimSpace(borrowerWallet) == "" {
 		return "fund the borrower wallet with the chain's native gas token before retrying repayment"
 	}
 	if isBaseChainID(chainID) {
-		return fmt.Sprintf("fund %s with ETH on Base (chain ID 8453) for gas, then retry repayment", borrowerWallet)
+		return fmt.Sprintf("fund %s with ETH on Base (chain ID 8453) for gas, rerun with --fund-gas-from-local, or retry repayment after funding", borrowerWallet)
 	}
 	return fmt.Sprintf("fund %s with the native gas token for chain %s, then retry repayment", borrowerWallet, chainID)
 }
@@ -373,6 +385,158 @@ func annotateLoanRepaymentError(err error, chainID, borrowerWallet string) error
 		return fmt.Errorf("%s: %s", msg, loanRepaymentGasHint(chainID, borrowerWallet))
 	}
 	return err
+}
+
+var (
+	loadCLIConfigFn        = loadCLIConfig
+	apiGetFn               = apiGet
+	evmRepayLoanFn         = evmRepayLoan
+	executeLoanRepaymentFn = executeLoanRepayment
+)
+
+type loanRepaymentMetadata struct {
+	ChainID        string `json:"chain_id"`
+	BorrowerWallet string `json:"borrower_wallet"`
+	SafeAddress    string `json:"safe_address"`
+	Status         string `json:"status"`
+}
+
+type localGasFunder struct {
+	AgentID       string
+	WalletAddress string
+	PrivateKey    string
+	BalanceWei    *big.Int
+}
+
+func isLoanRepaymentGasError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "insufficient funds for gas")
+}
+
+func defaultGasTopUpWei() *big.Int {
+	return big.NewInt(200_000_000_000_000) // 0.0002 ETH
+}
+
+func localGasFundingFeeBufferWei() *big.Int {
+	return big.NewInt(100_000_000_000_000) // 0.0001 ETH
+}
+
+func loanRepayGasNextActions(loanID, agentID, chainID, borrowerWallet string, includeLocalFunding bool) []NextAction {
+	actions := make([]NextAction, 0, 4)
+	if includeLocalFunding {
+		actions = append(actions, NextAction{
+			Command:     fmt.Sprintf("bob loan repay %s --amount <usdc> --agent-id %s --fund-gas-from-local --gas-funder-agent-id <agent-id>", loanID, agentID),
+			Description: "Retry repayment and top up Base gas from one explicitly selected local BOB wallet first",
+		})
+	}
+	if strings.TrimSpace(borrowerWallet) != "" {
+		if isBaseChainID(chainID) {
+			actions = append(actions, NextAction{
+				Command:     fmt.Sprintf("Fund %s with ETH on Base (chain ID 8453)", borrowerWallet),
+				Description: "Manual fallback if no local BOB wallet has spare Base gas",
+			})
+		} else {
+			actions = append(actions, NextAction{
+				Command:     fmt.Sprintf("Fund %s with the native gas token for chain %s", borrowerWallet, chainID),
+				Description: "Manual fallback if no local BOB wallet has spare gas",
+			})
+		}
+	}
+	if strings.TrimSpace(agentID) != "" {
+		actions = append(actions, NextAction{
+			Command:     fmt.Sprintf("bob wallet addresses --agent-id %s", agentID),
+			Description: "Inspect the borrower wallet and other local addresses",
+		})
+	}
+	actions = append(actions, NextAction{
+		Command:     fmt.Sprintf("bob loan status %s --agent-id %s", loanID, agentID),
+		Description: "Check loan balance and borrower wallet details before retrying",
+	})
+	return actions
+}
+
+func emitLoanRepayFailure(loanID, agentID string, err error, metadata *loanRepaymentMetadata, includeLocalFunding bool) {
+	if metadata == nil {
+		emitError("bob loan repay", err)
+		return
+	}
+	emitErrorWithActions("bob loan repay", err, loanRepayGasNextActions(loanID, agentID, metadata.ChainID, metadata.BorrowerWallet, includeLocalFunding))
+}
+
+func fetchLoanRepaymentMetadata(loanID string) (*loanRepaymentMetadata, error) {
+	statusResp, err := apiGetFn(fmt.Sprintf("/loans/agreements/%s", url.PathEscape(loanID)))
+	if err != nil {
+		return nil, fmt.Errorf("get loan status: %w", err)
+	}
+	var loan loanRepaymentMetadata
+	if err := json.Unmarshal(statusResp, &loan); err != nil {
+		return nil, fmt.Errorf("parse loan status: %w", err)
+	}
+	return &loan, nil
+}
+
+func selectLocalGasFunder(ctx context.Context, cfg cliConfig, chainID, borrowerWallet, funderAgentID string, minBalanceWei *big.Int) (*localGasFunder, error) {
+	if minBalanceWei == nil || minBalanceWei.Sign() <= 0 {
+		return nil, fmt.Errorf("minimum balance must be positive")
+	}
+	if !common.IsHexAddress(strings.TrimSpace(borrowerWallet)) {
+		return nil, fmt.Errorf("invalid borrower wallet address %q", borrowerWallet)
+	}
+	normalizedChainID, err := normalizeChainIDHex(chainID)
+	if err != nil {
+		return nil, err
+	}
+	funderAgentID = strings.TrimSpace(funderAgentID)
+	if funderAgentID == "" {
+		return nil, fmt.Errorf("gas funder agent ID is required for local gas funding")
+	}
+	keys, ok := cfg.WalletKeyring[funderAgentID]
+	if !ok {
+		return nil, fmt.Errorf("local keyring has no wallet for gas funder agent %s", funderAgentID)
+	}
+	addr := strings.TrimSpace(keys.EVMAddress)
+	if strings.TrimSpace(keys.EVMPrivateKey) == "" || addr == "" {
+		return nil, fmt.Errorf("gas funder agent %s has no local EVM wallet key", funderAgentID)
+	}
+	if !common.IsHexAddress(addr) {
+		return nil, fmt.Errorf("gas funder agent %s has invalid local EVM address %q", funderAgentID, addr)
+	}
+	if strings.EqualFold(addr, borrowerWallet) {
+		return nil, fmt.Errorf("gas funder agent %s uses the same borrower wallet %s", funderAgentID, borrowerWallet)
+	}
+
+	requiredBalance := new(big.Int).Add(new(big.Int).Set(minBalanceWei), localGasFundingFeeBufferWei())
+	balance, err := evmBalanceAt(ctx, normalizedChainID, common.HexToAddress(addr))
+	if err != nil {
+		return nil, fmt.Errorf("check Base gas balance for local funder %s (%s): %w", funderAgentID, addr, err)
+	}
+	if balance.Cmp(requiredBalance) < 0 {
+		return nil, fmt.Errorf("local funder %s (%s) needs at least %s wei including gas buffer, but only has %s wei", funderAgentID, addr, requiredBalance.String(), balance.String())
+	}
+	return &localGasFunder{
+		AgentID:       funderAgentID,
+		WalletAddress: addr,
+		PrivateKey:    keys.EVMPrivateKey,
+		BalanceWei:    new(big.Int).Set(balance),
+	}, nil
+}
+
+func fundBorrowerGasFromLocalKeyring(ctx context.Context, cfg cliConfig, chainID, borrowerWallet, funderAgentID string, amountWei *big.Int) (*localGasFunder, common.Hash, error) {
+	if !common.IsHexAddress(strings.TrimSpace(borrowerWallet)) {
+		return nil, common.Hash{}, fmt.Errorf("invalid borrower wallet address %q", borrowerWallet)
+	}
+	normalizedChainID, err := normalizeChainIDHex(chainID)
+	if err != nil {
+		return nil, common.Hash{}, err
+	}
+	funder, err := selectLocalGasFunder(ctx, cfg, normalizedChainID, borrowerWallet, funderAgentID, amountWei)
+	if err != nil {
+		return nil, common.Hash{}, err
+	}
+	hash, err := evmSendNativeValue(ctx, funder.PrivateKey, normalizedChainID, common.HexToAddress(borrowerWallet), amountWei)
+	if err != nil {
+		return funder, common.Hash{}, fmt.Errorf("fund gas from local wallet %s: %w", funder.WalletAddress, err)
+	}
+	return funder, hash, nil
 }
 
 func emitError(command string, err error) {
@@ -5421,11 +5585,12 @@ func walletCmd() *cobra.Command {
 				OK:      true,
 				Command: "bob wallet",
 				Data: map[string]any{
-					"subcommands": []string{"list", "balance", "credit-limit", "register", "addresses"},
+					"subcommands": []string{"list", "balance", "onchain-balances", "credit-limit", "register", "addresses"},
 				},
 				NextActions: []NextAction{
 					{Command: "bob wallet list", Description: "List registered wallets for an agent"},
 					{Command: "bob wallet balance", Description: "Show proven balance from verified proofs"},
+					{Command: "bob wallet onchain-balances", Description: "Show recent on-chain wallet balances from the BOB API"},
 					{Command: "bob wallet credit-limit", Description: "Show computed credit limit"},
 					{Command: "bob wallet addresses", Description: "Show locally generated wallet addresses"},
 				},
@@ -5453,6 +5618,15 @@ func walletCmd() *cobra.Command {
 	}
 	balanceCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
 	cmd.AddCommand(balanceCmd)
+
+	// bob wallet onchain-balances
+	onchainBalancesCmd := &cobra.Command{
+		Use:   "onchain-balances",
+		Short: "Show recent on-chain balances for registered wallets",
+		RunE:  runWalletOnchainBalances,
+	}
+	onchainBalancesCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
+	cmd.AddCommand(onchainBalancesCmd)
 
 	// bob wallet credit-limit
 	creditCmd := &cobra.Command{
@@ -5644,6 +5818,41 @@ func runWalletCreditLimit(cmd *cobra.Command, args []string) error {
 		NextActions: []NextAction{
 			{Command: "bob wallet balance --agent-id " + agentID, Description: "View proven balance"},
 			{Command: "bob wallet list --agent-id " + agentID, Description: "List registered wallets"},
+		},
+	})
+	return nil
+}
+
+func runWalletOnchainBalances(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob wallet onchain-balances", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	resp, err := apiGet(fmt.Sprintf("/agents/%s/onchain-balances", url.PathEscape(agentID)))
+	if err != nil {
+		emitError("bob wallet onchain-balances", err)
+		return nil
+	}
+
+	var result json.RawMessage
+	if err := json.Unmarshal(resp, &result); err != nil {
+		emitError("bob wallet onchain-balances", fmt.Errorf("failed to parse on-chain balances: %w", err))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet onchain-balances",
+		Data: map[string]any{
+			"agent_id":         agentID,
+			"onchain_balances": result,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet list --agent-id " + agentID, Description: "List registered wallets"},
+			{Command: "bob wallet balance --agent-id " + agentID, Description: "View proven balance from verified proofs"},
+			{Command: "bob wallet credit-limit --agent-id " + agentID, Description: "View credit limit"},
 		},
 	})
 	return nil
@@ -6180,6 +6389,8 @@ Requires both --tx and --amount.`,
 	repayCmd.Flags().String("agent-id", "", "Agent ID")
 	repayCmd.Flags().String("tx", "", "Existing transaction hash (skip on-chain execution)")
 	repayCmd.Flags().Int64("amount", 0, "Repayment amount in USDC micro-units (required)")
+	repayCmd.Flags().Bool("fund-gas-from-local", false, "If Base gas is missing, top up the borrower wallet from another local BOB wallet and retry")
+	repayCmd.Flags().String("gas-funder-agent-id", "", "Agent ID of the specific local BOB wallet allowed to fund Base gas for this repayment")
 	cmd.AddCommand(repayCmd)
 
 	// --- bob loan list ---
@@ -6290,6 +6501,8 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 
 	txHash, _ := cmd.Flags().GetString("tx")
 	amount, _ := cmd.Flags().GetInt64("amount")
+	fundGasFromLocal, _ := cmd.Flags().GetBool("fund-gas-from-local")
+	gasFunderAgentID, _ := cmd.Flags().GetString("gas-funder-agent-id")
 
 	// --amount is always required.
 	if amount <= 0 {
@@ -6299,10 +6512,42 @@ func runLoanRepay(cmd *cobra.Command, args []string) error {
 
 	// If no tx hash provided, execute the on-chain USDC transfer automatically.
 	if txHash == "" {
-		hash, _, err := executeLoanRepayment(loanID, agentID, amount)
-		if err != nil {
-			emitError("bob loan repay", err)
+		metadata, metaErr := fetchLoanRepaymentMetadata(loanID)
+		if metaErr != nil {
+			emitError("bob loan repay", metaErr)
 			return nil
+		}
+		hash, _, err := executeLoanRepaymentFn(loanID, agentID, amount)
+		if err != nil {
+			if fundGasFromLocal && isLoanRepaymentGasError(err) {
+				cfg, cfgErr := loadCLIConfigFn()
+				if cfgErr != nil {
+					emitError("bob loan repay", fmt.Errorf("%w (and failed to load local keyring for gas funding: %v)", err, cfgErr))
+					return nil
+				}
+
+				ctx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
+				defer cancel()
+				funder, gasTx, fundErr := fundBorrowerGasFromLocalKeyring(ctx, cfg, metadata.ChainID, metadata.BorrowerWallet, gasFunderAgentID, defaultGasTopUpWei())
+				if fundErr != nil {
+					emitLoanRepayFailure(loanID, agentID, fmt.Errorf("%w (%v)", err, fundErr), metadata, true)
+					return nil
+				}
+				fmt.Fprintf(os.Stderr, "funded borrower gas from local wallet %s (agent %s) via %s; retrying repayment...\n", funder.WalletAddress, funder.AgentID, gasTx.Hex())
+
+				hash, _, err = executeLoanRepaymentFn(loanID, agentID, amount)
+				if err != nil {
+					emitLoanRepayFailure(loanID, agentID, fmt.Errorf("gas top-up succeeded via %s from %s, but repayment still failed: %w", gasTx.Hex(), funder.WalletAddress, err), metadata, false)
+					return nil
+				}
+			} else {
+				if isLoanRepaymentGasError(err) {
+					emitLoanRepayFailure(loanID, agentID, err, metadata, true)
+					return nil
+				}
+				emitError("bob loan repay", err)
+				return nil
+			}
 		}
 		txHash = hash
 	}
@@ -6368,7 +6613,7 @@ func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string
 	}
 
 	// 1. Get loan status to find safe address, chain, and amount owed.
-	statusResp, err := apiGet(fmt.Sprintf("/loans/agreements/%s", url.PathEscape(loanID)))
+	statusResp, err := apiGetFn(fmt.Sprintf("/loans/agreements/%s", url.PathEscape(loanID)))
 	if err != nil {
 		return "", 0, fmt.Errorf("get loan status: %w", err)
 	}
@@ -6395,6 +6640,10 @@ func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string
 	if loan.ChainID == "" {
 		return "", 0, fmt.Errorf("loan has no chain_id")
 	}
+	normalizedChainID, err := normalizeChainIDHex(loan.ChainID)
+	if err != nil {
+		return "", 0, err
+	}
 
 	totalOwed := loan.Principal + loan.InterestAccrued
 	outstanding := totalOwed - loan.AmountRepaid
@@ -6408,7 +6657,7 @@ func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string
 	}
 
 	// 2. Load EVM private key.
-	cfg, loadErr := loadCLIConfig()
+	cfg, loadErr := loadCLIConfigFn()
 	if loadErr != nil {
 		return "", 0, fmt.Errorf("load config: %w", loadErr)
 	}
@@ -6429,11 +6678,11 @@ func executeLoanRepayment(loanID, agentID string, requestedAmount int64) (string
 	amount := big.NewInt(repayAmount)
 
 	fmt.Fprintf(os.Stderr, "repaying %d USDC (micro) from %s to %s on chain %s...\n",
-		repayAmount, loan.BorrowerWallet, loan.SafeAddress, loan.ChainID)
+		repayAmount, loan.BorrowerWallet, loan.SafeAddress, normalizedChainID)
 
-	hash, err := evmRepayLoan(ctx, keys.EVMPrivateKey, loan.ChainID, borrowerWallet, lenderSafe, amount)
+	hash, err := evmRepayLoanFn(ctx, keys.EVMPrivateKey, normalizedChainID, borrowerWallet, lenderSafe, amount)
 	if err != nil {
-		return "", 0, annotateLoanRepaymentError(fmt.Errorf("on-chain transfer failed: %w", err), loan.ChainID, loan.BorrowerWallet)
+		return "", 0, annotateLoanRepaymentError(fmt.Errorf("on-chain transfer failed: %w", err), normalizedChainID, loan.BorrowerWallet)
 	}
 
 	return hash.Hex(), repayAmount, nil
