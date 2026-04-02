@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"filippo.io/edwards25519"
+	"github.com/spf13/cobra"
 )
 
 // Solana program addresses (mainnet).
@@ -487,6 +488,146 @@ func solSendTransaction(ctx context.Context, rpcURL string, signedTx []byte) (st
 		return "", fmt.Errorf("parse tx signature: %w", err)
 	}
 	return sig, nil
+}
+
+// solTransferNative sends native SOL from the agent's wallet to a recipient.
+func solTransferNative(ctx context.Context, privKeyHex string, to string, lamports uint64) (string, error) {
+	rpcURL := solanaRPCURL()
+
+	privKeyBytes, err := hex.DecodeString(strings.TrimPrefix(privKeyHex, "0x"))
+	if err != nil {
+		return "", fmt.Errorf("decode private key: %w", err)
+	}
+
+	var privKey ed25519.PrivateKey
+	switch len(privKeyBytes) {
+	case ed25519.SeedSize:
+		privKey = ed25519.NewKeyFromSeed(privKeyBytes)
+	case ed25519.PrivateKeySize:
+		privKey = ed25519.PrivateKey(privKeyBytes)
+	default:
+		return "", fmt.Errorf("invalid Ed25519 key length: got %d, want 32 or 64", len(privKeyBytes))
+	}
+	pubKey := privKey.Public().(ed25519.PublicKey)
+
+	toBytes := base58Decode(to)
+	if len(toBytes) != 32 {
+		return "", fmt.Errorf("invalid recipient address: %s", to)
+	}
+
+	fromPK := toArr32(pubKey)
+	toPK := toArr32(toBytes)
+
+	blockhash, err := solGetRecentBlockhash(ctx, rpcURL)
+	if err != nil {
+		return "", fmt.Errorf("get recent blockhash: %w", err)
+	}
+
+	// System program transfer instruction (index 2).
+	data := make([]byte, 12)
+	binary.LittleEndian.PutUint32(data[0:4], 2) // Transfer instruction index
+	binary.LittleEndian.PutUint64(data[4:12], lamports)
+
+	ix := solInstruction{
+		programID: toArr32(solSystemProgram),
+		accounts: []solAccountMeta{
+			{pubkey: fromPK, isSigner: true, isWritable: true},
+			{pubkey: toPK, isSigner: false, isWritable: true},
+		},
+		data: data,
+	}
+
+	message := serializeSolMessage(blockhash, fromPK, []solInstruction{ix})
+	sig := ed25519.Sign(privKey, message)
+	signedTx := encodeSolSignedTx(sig, message)
+
+	fmt.Fprintf(os.Stderr, "broadcasting SOL native transfer...\n")
+
+	txSig, err := solSendTransaction(ctx, rpcURL, signedTx)
+	if err != nil {
+		return "", fmt.Errorf("send transaction: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "tx signature: %s\n", txSig)
+
+	if err := solConfirmTransaction(ctx, rpcURL, txSig); err != nil {
+		return "", fmt.Errorf("transaction sent but confirmation failed (sig: %s) — check Solana explorer: %w", txSig, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "confirmed\n")
+	return txSig, nil
+}
+
+// runSendSOL handles `bob send sol --to <addr> --amount <atomic> [--token usdc|native]`.
+func runSendSOL(cmd *cobra.Command, args []string) error {
+	to, _ := cmd.Flags().GetString("to")
+	amountStr, _ := cmd.Flags().GetString("amount")
+	token, _ := cmd.Flags().GetString("token")
+
+	amount, ok := new(big.Int).SetString(amountStr, 10)
+	if !ok || amount.Sign() <= 0 {
+		emitError("bob send sol", fmt.Errorf("amount must be a positive integer (got %q)", amountStr))
+		return nil
+	}
+	if !amount.IsUint64() {
+		emitError("bob send sol", fmt.Errorf("amount %s exceeds uint64 range", amountStr))
+		return nil
+	}
+
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		emitError("bob send sol", fmt.Errorf("load config: %w", err))
+		return nil
+	}
+	keys := cfg.activeWalletKeys()
+	if keys == nil || keys.SOLPrivateKey == "" {
+		emitErrorWithActions("bob send sol", fmt.Errorf("no Solana wallet key found"), []NextAction{
+			{Command: "bob init", Description: "Initialize wallet keys"},
+		})
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var (
+		txSig     string
+		sendErr   error
+		tokenName string
+	)
+
+	switch strings.ToLower(token) {
+	case "native", "sol":
+		txSig, sendErr = solTransferNative(ctx, keys.SOLPrivateKey, to, amount.Uint64())
+		tokenName = "SOL"
+	case "usdc", "":
+		txSig, sendErr = solTransferUSDC(ctx, keys.SOLPrivateKey, to, amount.Uint64())
+		tokenName = "USDC"
+	default:
+		emitError("bob send sol", fmt.Errorf("unsupported token %q — use usdc or native", token))
+		return nil
+	}
+
+	if sendErr != nil {
+		emitError("bob send sol", sendErr)
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob send sol",
+		Data: map[string]any{
+			"signature": txSig,
+			"to":        to,
+			"amount":    amount.String(),
+			"token":     tokenName,
+			"explorer":  "https://solscan.io/tx/" + txSig,
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet balance", Description: "Check wallet balances"},
+		},
+	})
+	return nil
 }
 
 func solConfirmTransaction(ctx context.Context, rpcURL string, sig string) error {

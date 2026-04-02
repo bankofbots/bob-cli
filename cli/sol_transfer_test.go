@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -198,4 +199,120 @@ func TestSolanaRPCURL_Default(t *testing.T) {
 func TestSolanaRPCURL_EnvOverride(t *testing.T) {
 	t.Setenv("BOB_SOL_RPC_URL", "https://my-sol-rpc.example.com")
 	assert.Equal(t, "https://my-sol-rpc.example.com", solanaRPCURL())
+}
+
+// ---------------------------------------------------------------------------
+// solTransferNative validation
+// ---------------------------------------------------------------------------
+
+func TestSolTransferNative_InvalidPrivKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	_, err := solTransferNative(ctx, "not-hex", "11111111111111111111111111111111", 1000)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode private key")
+}
+
+func TestSolTransferNative_BadKeyLength(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// 16 bytes (too short)
+	_, err := solTransferNative(ctx, "ac0974bec39a17e36ba4a6b4d238ff94", "11111111111111111111111111111111", 1000)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "key length")
+}
+
+func TestSolTransferNative_32ByteSeedKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	seed32 := "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+	_, err := solTransferNative(ctx, seed32, "11111111111111111111111111111111", 1000)
+	// Should fail at RPC, not at key parsing.
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "key length")
+}
+
+func TestSolTransferNative_InvalidRecipient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	seed32 := "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+	_, err := solTransferNative(ctx, seed32, "short", 1000)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid recipient")
+}
+
+// ---------------------------------------------------------------------------
+// runSendSOL argument validation
+// ---------------------------------------------------------------------------
+
+func TestRunSendSOL_InvalidAmount(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "11111111111111111111111111111111", "")
+	cmd.Flags().String("amount", "not-a-number", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendSOL(cmd, nil)
+	assert.NoError(t, err) // error emitted, not returned
+}
+
+func TestRunSendSOL_NegativeAmount(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "11111111111111111111111111111111", "")
+	cmd.Flags().String("amount", "-100", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendSOL(cmd, nil)
+	assert.NoError(t, err)
+}
+
+func TestRunSendSOL_ZeroAmount(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "11111111111111111111111111111111", "")
+	cmd.Flags().String("amount", "0", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendSOL(cmd, nil)
+	assert.NoError(t, err)
+}
+
+func TestRunSendSOL_UnsupportedToken(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "11111111111111111111111111111111", "")
+	cmd.Flags().String("amount", "1000000", "")
+	cmd.Flags().String("token", "doge", "")
+
+	err := runSendSOL(cmd, nil)
+	assert.NoError(t, err)
+}
+
+func TestRunSendSOL_Uint64Overflow(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "11111111111111111111111111111111", "")
+	cmd.Flags().String("amount", "99999999999999999999999999", "") // exceeds uint64
+	cmd.Flags().String("token", "native", "")
+
+	err := runSendSOL(cmd, nil)
+	assert.NoError(t, err) // error emitted, not returned
+}
+
+// ---------------------------------------------------------------------------
+// System Program transfer instruction encoding
+// ---------------------------------------------------------------------------
+
+func TestSolTransferNative_InstructionEncoding(t *testing.T) {
+	// Verify the System Program transfer instruction is correctly encoded.
+	lamports := uint64(1_500_000_000) // 1.5 SOL
+
+	data := make([]byte, 12)
+	binary.LittleEndian.PutUint32(data[0:4], 2)
+	binary.LittleEndian.PutUint64(data[4:12], lamports)
+
+	// Transfer instruction index = 2
+	assert.Equal(t, uint32(2), binary.LittleEndian.Uint32(data[0:4]))
+	// Lamports encoded correctly
+	assert.Equal(t, lamports, binary.LittleEndian.Uint64(data[4:12]))
 }

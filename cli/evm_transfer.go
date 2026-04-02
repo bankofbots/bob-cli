@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/spf13/cobra"
 )
 
 var evmBalanceAt = evmNativeBalance
@@ -329,6 +330,110 @@ func evmNativeBalance(ctx context.Context, chainIDHex string, addr common.Addres
 		return nil, fmt.Errorf("read balance: %w", err)
 	}
 	return balance, nil
+}
+
+// runSendEVM handles `bob send evm --to <addr> --amount <atomic> [--token usdc|native]`.
+func runSendEVM(cmd *cobra.Command, args []string) error {
+	to, _ := cmd.Flags().GetString("to")
+	amountStr, _ := cmd.Flags().GetString("amount")
+	token, _ := cmd.Flags().GetString("token")
+
+	amount, ok := new(big.Int).SetString(amountStr, 10)
+	if !ok || amount.Sign() <= 0 {
+		emitError("bob send evm", fmt.Errorf("amount must be a positive integer (got %q)", amountStr))
+		return nil
+	}
+	// EVM uint256 upper bound: 2^256 - 1.
+	uint256Max := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	if amount.Cmp(uint256Max) > 0 {
+		emitError("bob send evm", fmt.Errorf("amount exceeds uint256 max (2^256 - 1)"))
+		return nil
+	}
+	if !common.IsHexAddress(to) {
+		emitError("bob send evm", fmt.Errorf("invalid EVM address: %s", to))
+		return nil
+	}
+
+	cfg, err := loadCLIConfig()
+	if err != nil {
+		emitError("bob send evm", fmt.Errorf("load config: %w", err))
+		return nil
+	}
+	keys := cfg.activeWalletKeys()
+	if keys == nil || keys.EVMPrivateKey == "" {
+		emitErrorWithActions("bob send evm", fmt.Errorf("no EVM wallet key found"), []NextAction{
+			{Command: "bob init", Description: "Initialize wallet keys"},
+		})
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	toAddr := common.HexToAddress(to)
+	chainIDHex := "0x2105" // Base
+
+	var txHash common.Hash
+	switch strings.ToLower(token) {
+	case "native", "eth":
+		txHash, err = evmSendNative(ctx, keys.EVMPrivateKey, chainIDHex, toAddr, amount)
+	case "usdc", "":
+		usdcAddr, uErr := usdcAddressForChain(chainIDHex)
+		if uErr != nil {
+			emitError("bob send evm", uErr)
+			return nil
+		}
+		rpcURL, rErr := rpcURLForChain(chainIDHex)
+		if rErr != nil {
+			emitError("bob send evm", rErr)
+			return nil
+		}
+		privKeyBytes, decErr := hex.DecodeString(strings.TrimPrefix(keys.EVMPrivateKey, "0x"))
+		if decErr != nil {
+			emitError("bob send evm", fmt.Errorf("decode private key: %w", decErr))
+			return nil
+		}
+		ecKey, kErr := ethcrypto.ToECDSA(privKeyBytes)
+		if kErr != nil {
+			emitError("bob send evm", fmt.Errorf("parse private key: %w", kErr))
+			return nil
+		}
+		client, cErr := ethclient.DialContext(ctx, rpcURL)
+		if cErr != nil {
+			emitError("bob send evm", fmt.Errorf("connect to RPC: %w", cErr))
+			return nil
+		}
+		defer client.Close()
+
+		chainID, _ := new(big.Int).SetString("2105", 16)
+		data := encodeERC20TransferCall(toAddr, amount)
+		txHash, err = signAndSend(ctx, client, ecKey, chainID, usdcAddr, data)
+	default:
+		emitError("bob send evm", fmt.Errorf("unsupported token %q — use usdc or native", token))
+		return nil
+	}
+
+	if err != nil {
+		emitError("bob send evm", err)
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob send evm",
+		Data: map[string]any{
+			"tx_hash":  txHash.Hex(),
+			"to":       to,
+			"amount":   amount.String(),
+			"token":    token,
+			"chain":    "base",
+			"explorer": "https://basescan.org/tx/" + txHash.Hex(),
+		},
+		NextActions: []NextAction{
+			{Command: "bob wallet balance", Description: "Check wallet balances"},
+		},
+	})
+	return nil
 }
 
 func evmSendNative(ctx context.Context, privKeyHex string, chainIDHex string, to common.Address, amountWei *big.Int) (common.Hash, error) {

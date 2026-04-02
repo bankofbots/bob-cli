@@ -690,10 +690,12 @@ func sendCmd() *cobra.Command {
 				OK:      true,
 				Command: "bob send",
 				Data: map[string]any{
-					"subcommands": []string{"btc"},
+					"subcommands": []string{"btc", "evm", "sol"},
 				},
 				NextActions: []NextAction{
 					{Command: "bob send btc --to <address> --amount <sats>", Description: "Send BTC to an address"},
+					{Command: "bob send evm --to <address> --amount <usdc> [--token usdc|native]", Description: "Send USDC or ETH on Base"},
+					{Command: "bob send sol --to <address> --amount <usdc> [--token usdc|native]", Description: "Send USDC or SOL on Solana"},
 				},
 			})
 			return nil
@@ -715,7 +717,35 @@ func sendCmd() *cobra.Command {
 	_ = btcCmd.MarkFlagRequired("to")
 	_ = btcCmd.MarkFlagRequired("amount")
 
+	evmCmd := &cobra.Command{
+		Use:   "evm",
+		Short: "Send USDC or ETH on Base",
+		RunE:  runSendEVM,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	evmCmd.Flags().String("to", "", "Recipient EVM address (0x...)")
+	evmCmd.Flags().String("amount", "", "Amount in atomic units (USDC: 6 decimals, e.g. 10000000 = 10 USDC; native: wei)")
+	evmCmd.Flags().String("token", "usdc", "Token to send: usdc or native")
+	_ = evmCmd.MarkFlagRequired("to")
+	_ = evmCmd.MarkFlagRequired("amount")
+
+	solCmd := &cobra.Command{
+		Use:   "sol",
+		Short: "Send USDC or SOL on Solana",
+		RunE:  runSendSOL,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	solCmd.Flags().String("to", "", "Recipient Solana address (base58)")
+	solCmd.Flags().String("amount", "", "Amount in atomic units (USDC: 6 decimals; SOL: lamports)")
+	solCmd.Flags().String("token", "usdc", "Token to send: usdc or native")
+	_ = solCmd.MarkFlagRequired("to")
+	_ = solCmd.MarkFlagRequired("amount")
+
 	cmd.AddCommand(btcCmd)
+	cmd.AddCommand(evmCmd)
+	cmd.AddCommand(solCmd)
 	return cmd
 }
 

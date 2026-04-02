@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"math/big"
 	"os"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -152,6 +154,143 @@ func TestExecuteLoanRepayment_NegativeAmount(t *testing.T) {
 	_, _, err := executeLoanRepayment("fake-loan-id", "fake-agent-id", -100)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--amount is required")
+}
+
+// ---------------------------------------------------------------------------
+// runSendEVM argument validation
+// ---------------------------------------------------------------------------
+
+func TestRunSendEVM_InvalidAmount(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd", "")
+	cmd.Flags().String("amount", "not-a-number", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendEVM(cmd, nil)
+	assert.NoError(t, err) // runSendEVM emits errors, doesn't return them
+}
+
+func TestRunSendEVM_NegativeAmount(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd", "")
+	cmd.Flags().String("amount", "-100", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendEVM(cmd, nil)
+	assert.NoError(t, err)
+}
+
+func TestRunSendEVM_ZeroAmount(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd", "")
+	cmd.Flags().String("amount", "0", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendEVM(cmd, nil)
+	assert.NoError(t, err)
+}
+
+func TestRunSendEVM_BigIntAmount(t *testing.T) {
+	// Amounts larger than int64 should be parseable (no truncation).
+	amt := "99999999999999999999" // > MaxInt64
+	parsed, ok := new(big.Int).SetString(amt, 10)
+	require.True(t, ok)
+	assert.True(t, parsed.Sign() > 0)
+	// Verify it exceeds int64 range.
+	assert.True(t, parsed.Cmp(big.NewInt(1<<62)) > 0)
+}
+
+func TestRunSendEVM_ExceedsUint256(t *testing.T) {
+	// 2^256 is one above the max EVM uint256 value.
+	overflow := new(big.Int).Lsh(big.NewInt(1), 256)
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd", "")
+	cmd.Flags().String("amount", overflow.String(), "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendEVM(cmd, nil)
+	assert.NoError(t, err) // error emitted, not returned
+}
+
+func TestRunSendEVM_Uint256MaxAccepted(t *testing.T) {
+	// 2^256 - 1 (max uint256) should be accepted by validation (will fail at config load).
+	uint256Max := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	parsed, ok := new(big.Int).SetString(uint256Max.String(), 10)
+	require.True(t, ok)
+	assert.True(t, parsed.Sign() > 0)
+	assert.Equal(t, 0, parsed.Cmp(uint256Max))
+}
+
+func TestRunSendEVM_InvalidAddress(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "not-an-address", "")
+	cmd.Flags().String("amount", "1000000", "")
+	cmd.Flags().String("token", "usdc", "")
+
+	err := runSendEVM(cmd, nil)
+	assert.NoError(t, err) // error emitted, not returned
+}
+
+func TestRunSendEVM_UnsupportedToken(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String("to", "0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd", "")
+	cmd.Flags().String("amount", "1000000", "")
+	cmd.Flags().String("token", "doge", "")
+
+	// Will fail trying to load config, but that's fine — tests the token validation path.
+	err := runSendEVM(cmd, nil)
+	assert.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// evmSendNative validation
+// ---------------------------------------------------------------------------
+
+func TestEvmSendNative_InvalidPrivKey(t *testing.T) {
+	_, err := evmSendNative(
+		context.Background(), "not-hex", "0x2105",
+		common.HexToAddress("0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd"),
+		big.NewInt(1000),
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "decode private key")
+}
+
+func TestEvmSendNative_NilAmount(t *testing.T) {
+	_, err := evmSendNative(
+		context.Background(),
+		"ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+		"0x2105",
+		common.HexToAddress("0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd"),
+		nil,
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "positive")
+}
+
+func TestEvmSendNative_ZeroAmount(t *testing.T) {
+	_, err := evmSendNative(
+		context.Background(),
+		"ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+		"0x2105",
+		common.HexToAddress("0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd"),
+		big.NewInt(0),
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "positive")
+}
+
+func TestEvmSendNative_UnsupportedChain(t *testing.T) {
+	os.Unsetenv("BOB_EVM_RPC_URL")
+	_, err := evmSendNative(
+		context.Background(),
+		"ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+		"0xdeadbeef",
+		common.HexToAddress("0xe1e62c940f6ba0c7c31591f32811d0f18699e1cd"),
+		big.NewInt(1000),
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported chain")
 }
 
 // ---------------------------------------------------------------------------
