@@ -143,14 +143,26 @@ func signEVMChallenge(message, privKeyHex string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("sign: %w", err)
 	}
-
-	// go-ethereum returns [R || S || V] where V is 0 or 1.
-	// EIP-191 expects V = 27 or 28.
-	if len(sig) == 65 && sig[64] < 27 {
-		sig[64] += 27
+	if err := normalizeEthereumRecoveryID(sig); err != nil {
+		return "", err
 	}
 
 	return "0x" + hex.EncodeToString(sig), nil
+}
+
+func normalizeEthereumRecoveryID(sig []byte) error {
+	if len(sig) != 65 {
+		return fmt.Errorf("signature must be 65 bytes")
+	}
+	// go-ethereum returns [R || S || V] where V is 0 or 1.
+	// External verifiers in this codebase expect the canonical 27/28 form.
+	if sig[64] < 27 {
+		sig[64] += 27
+	}
+	if sig[64] != 27 && sig[64] != 28 {
+		return fmt.Errorf("unexpected recovery ID %d after normalization", sig[64])
+	}
+	return nil
 }
 
 // signBTCChallenge signs a message using BIP-137 Bitcoin Signed Message format.
@@ -194,7 +206,7 @@ func signBTCChallenge(message, privKeyHex string) (string, error) {
 	v += 4 // compressed public key
 	var bip137Sig [65]byte
 	bip137Sig[0] = v
-	copy(bip137Sig[1:33], sig[0:32])  // R
+	copy(bip137Sig[1:33], sig[0:32])   // R
 	copy(bip137Sig[33:65], sig[32:64]) // S
 
 	return base64.StdEncoding.EncodeToString(bip137Sig[:]), nil

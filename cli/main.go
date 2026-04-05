@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.55.0"
+const version = "0.56.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -351,6 +351,14 @@ func emit(env Envelope) {
 	enc.Encode(env)
 }
 
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "api error (404)")
+}
+
 func isBaseChainID(chainID string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(chainID))
 	return normalized == "8453" || normalized == "0x2105" || normalized == "eip155:8453" || normalized == "base"
@@ -392,6 +400,7 @@ func annotateLoanRepaymentError(err error, chainID, borrowerWallet string) error
 var (
 	loadCLIConfigFn        = loadCLIConfig
 	apiGetFn               = apiGet
+	apiPostFn              = apiPost
 	evmRepayLoanFn         = evmRepayLoan
 	executeLoanRepaymentFn = executeLoanRepayment
 )
@@ -2037,6 +2046,7 @@ func main() {
 	root.AddCommand(apiKeyCmd())
 	root.AddCommand(registerCmd())
 	root.AddCommand(walletCmd())
+	root.AddCommand(treasuryCmd())
 	root.AddCommand(loanCmd())
 	root.AddCommand(sendCmd())
 	root.AddCommand(updateCmd())
@@ -2457,6 +2467,7 @@ func initSession(cmd *cobra.Command, args []string) error {
 		{Command: "bob auth me", Description: "Verify your key and role"},
 		{Command: "bob doctor", Description: "Show active API URL + auth/config status"},
 		{Command: fmt.Sprintf("bob agent get %s", agentID), Description: "Inspect agent details"},
+		{Command: fmt.Sprintf("bob treasury status --agent-id %s", agentID), Description: "Check whether treasury is provisioned before enabling autonomous spending"},
 	}
 
 	if agentName == "" {
@@ -2527,6 +2538,7 @@ func initSession(cmd *cobra.Command, args []string) error {
 	if len(walletData) > 0 {
 		initData["wallets"] = walletData
 	}
+	warnings = append(warnings, "if this agent will spend autonomously, treasury should be provisioned and policy-enabled before sending funds; check with: bob treasury status --agent-id "+agentID)
 
 	emit(Envelope{
 		OK:          true,
@@ -2630,7 +2642,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	authResult := map[string]any{"checked": false}
 	if strings.TrimSpace(apiKey) != "" {
-		authData, err := apiGet("/auth/me")
+		authData, err := apiGetFn("/auth/me")
 		authResult["checked"] = true
 		if err != nil {
 			authResult["ok"] = false
@@ -2659,7 +2671,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	missing := []string{}
 
 	// Check wallet keys in local config.
-	doctorCfg, cfgErr := loadCLIConfig()
+	doctorCfg, cfgErr := loadCLIConfigFn()
 	if cfgErr == nil {
 		if wk := doctorCfg.activeWalletKeys(); wk == nil || wk.EVMAddress == "" {
 			missing = append(missing, "wallet_keys")
@@ -2676,15 +2688,58 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		resolvedAgentID = doctorCfg.AgentID
 	}
 	if resolvedAgentID != "" && strings.TrimSpace(apiKey) != "" {
-		_, passportErr := apiGet("/agents/" + resolvedAgentID + "/credential")
+		_, passportErr := apiGetFn("/agents/" + url.PathEscape(resolvedAgentID) + "/credential")
 		if passportErr != nil {
-			errMsg := extractAPIErrorMessage(passportErr)
-			if strings.Contains(errMsg, "404") || strings.Contains(strings.ToLower(errMsg), "not found") {
+			if isNotFoundError(passportErr) {
 				missing = append(missing, "passport")
 				warnings = append(warnings, "no passport issued; run 'bob init' to create one")
 			}
 		}
 	}
+
+	treasuryResult := map[string]any{"checked": false}
+	if resolvedAgentID != "" && strings.TrimSpace(apiKey) != "" {
+		treasuryResult["checked"] = true
+		accountResp, accountErr := apiGetFn("/agents/" + url.PathEscape(resolvedAgentID) + "/treasury/accounts")
+		if accountErr != nil {
+			treasuryResult["ok"] = false
+			treasuryResult["error"] = extractAPIErrorMessage(accountErr)
+		} else {
+			var accountsEnvelope struct {
+				Accounts []json.RawMessage `json:"accounts"`
+			}
+			if err := json.Unmarshal(accountResp, &accountsEnvelope); err != nil {
+				treasuryResult["ok"] = false
+				treasuryResult["error"] = "failed to parse treasury accounts"
+			} else {
+				activeAccountCount := countActiveTreasuryAccounts(accountsEnvelope.Accounts)
+				treasuryResult["account_present"] = activeAccountCount > 0
+				treasuryResult["account_count"] = len(accountsEnvelope.Accounts)
+				treasuryResult["active_account_count"] = activeAccountCount
+				policyPresent := false
+				policyResp, policyErr := apiGetFn("/agents/" + url.PathEscape(resolvedAgentID) + "/treasury/policies/active")
+				if policyErr == nil {
+					policyPresent = true
+					var policy map[string]any
+					if err := json.Unmarshal(policyResp, &policy); err == nil {
+						treasuryResult["active_policy"] = policy
+					}
+				} else {
+					if !isNotFoundError(policyErr) {
+						treasuryResult["policy_error"] = extractAPIErrorMessage(policyErr)
+					}
+				}
+				treasuryResult["active_policy_present"] = policyPresent
+				ready := activeAccountCount > 0 && policyPresent
+				treasuryResult["ready_for_spending"] = ready
+				treasuryResult["ok"] = true
+				if !ready {
+					warnings = append(warnings, "treasury is not ready for governed spending; before enabling autonomous payments, provision a 2-of-2 treasury account and active policy")
+				}
+			}
+		}
+	}
+	result["treasury"] = treasuryResult
 
 	if len(missing) > 0 {
 		result["setup_incomplete"] = true
@@ -2695,6 +2750,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	nextActions := []NextAction{
 		{Command: "bob auth me", Description: "Verify authenticated identity"},
+		{Command: "bob treasury status", Description: "Check whether treasury is ready before enabling autonomous spending"},
 	}
 	if strings.TrimSpace(apiKey) == "" {
 		nextActions = append(nextActions, NextAction{Command: "export BOB_API_KEY=<your-key>", Description: "Set API key for authenticated commands"})
@@ -5831,7 +5887,7 @@ func walletCmd() *cobra.Command {
 				OK:      true,
 				Command: "bob wallet",
 				Data: map[string]any{
-					"subcommands": []string{"list", "balance", "onchain-balances", "credit-limit", "register", "addresses"},
+					"subcommands": []string{"list", "balance", "onchain-balances", "credit-limit", "register", "addresses", "sweep"},
 				},
 				NextActions: []NextAction{
 					{Command: "bob wallet list", Description: "List registered wallets for an agent"},
@@ -5840,6 +5896,7 @@ func walletCmd() *cobra.Command {
 					{Command: "bob wallet gas-candidates", Description: "Show local EVM wallets that can fund Base gas"},
 					{Command: "bob wallet credit-limit", Description: "Show computed credit limit"},
 					{Command: "bob wallet addresses", Description: "Show locally generated wallet addresses"},
+					{Command: "bob wallet sweep --from-agent-id <old-agent> --to-agent-id <new-agent> --dry-run", Description: "Preview moving native gas from an old local wallet to a new local wallet"},
 				},
 			})
 			return nil
@@ -5916,6 +5973,27 @@ func walletCmd() *cobra.Command {
 	}
 	addressesCmd.Flags().String("agent-id", "", "Agent ID (defaults to config agent_id)")
 	cmd.AddCommand(addressesCmd)
+
+	// bob wallet sweep
+	sweepCmd := &cobra.Command{
+		Use:   "sweep",
+		Short: "Sweep native gas from one local agent wallet to another",
+		Long: `Recover native gas from an old local wallet key into another wallet.
+
+Currently supports Base native ETH only.`,
+		RunE: runWalletSweep,
+	}
+	sweepCmd.Flags().String("from-agent-id", "", "Source agent ID in local wallet keyring (required)")
+	sweepCmd.Flags().String("to-agent-id", "", "Destination agent ID in local wallet keyring (required if --to-address is unset)")
+	sweepCmd.Flags().String("to-address", "", "Destination EVM address (optional alternative to --to-agent-id)")
+	sweepCmd.Flags().String("chain", "base", "Chain for native sweep (currently Base)")
+	sweepCmd.Flags().String("asset", "native", "Asset to sweep (currently native only)")
+	sweepCmd.Flags().String("leave-wei", localGasFundingFeeBufferWei().String(), "Amount of source native balance to keep for residual gas")
+	sweepCmd.Flags().String("max-wei", "", "Optional cap for sweep transfer amount in wei")
+	sweepCmd.Flags().Bool("dry-run", false, "Preview sweep amount and addresses without broadcasting")
+	sweepCmd.Flags().Bool("yes", false, "Confirm the sweep transfer (required for non-dry-run)")
+	_ = sweepCmd.MarkFlagRequired("from-agent-id")
+	cmd.AddCommand(sweepCmd)
 
 	// bob wallet provision-check
 	provisionCheckCmd := &cobra.Command{
@@ -6304,6 +6382,232 @@ func runWalletAddresses(cmd *cobra.Command, args []string) error {
 			{Command: "bob wallet list", Description: "List wallets registered with BOB"},
 			{Command: "bob wallet balance", Description: "View proven balance"},
 		},
+	})
+	return nil
+}
+
+func runWalletSweep(cmd *cobra.Command, args []string) error {
+	cfg, err := loadCLIConfigFn()
+	if err != nil {
+		emitError("bob wallet sweep", fmt.Errorf("failed to load config: %w", err))
+		return nil
+	}
+	if len(cfg.WalletKeyring) == 0 {
+		emitErrorWithActions("bob wallet sweep", fmt.Errorf("no local wallet keyring found — run bob init first"), []NextAction{
+			{Command: "bob init --code <claim-code>", Description: "Initialize a local BOB agent wallet set"},
+			{Command: "bob wallet addresses", Description: "Inspect the current agent's locally generated addresses"},
+		})
+		return nil
+	}
+
+	fromAgentID, _ := cmd.Flags().GetString("from-agent-id")
+	toAgentID, _ := cmd.Flags().GetString("to-agent-id")
+	toAddress, _ := cmd.Flags().GetString("to-address")
+	chainFlag, _ := cmd.Flags().GetString("chain")
+	asset, _ := cmd.Flags().GetString("asset")
+	leaveWeiRaw, _ := cmd.Flags().GetString("leave-wei")
+	maxWeiRaw, _ := cmd.Flags().GetString("max-wei")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	yes, _ := cmd.Flags().GetBool("yes")
+
+	if strings.TrimSpace(fromAgentID) == "" {
+		emitError("bob wallet sweep", fmt.Errorf("--from-agent-id is required"))
+		return nil
+	}
+	if strings.TrimSpace(asset) != "" && !strings.EqualFold(strings.TrimSpace(asset), "native") {
+		emitError("bob wallet sweep", fmt.Errorf("unsupported --asset %q (only native is supported)", asset))
+		return nil
+	}
+
+	normalizedChainID, err := normalizeChainIDHex(chainFlag)
+	if err != nil {
+		emitError("bob wallet sweep", err)
+		return nil
+	}
+	if !isBaseChainID(normalizedChainID) {
+		emitError("bob wallet sweep", fmt.Errorf("only Base is supported for sweep right now"))
+		return nil
+	}
+
+	fromKeys := cfg.walletKeysForAgent(strings.TrimSpace(fromAgentID))
+	if fromKeys == nil {
+		emitError("bob wallet sweep", fmt.Errorf("no local keyring entry for agent %s", fromAgentID))
+		return nil
+	}
+	if strings.TrimSpace(fromKeys.EVMPrivateKey) == "" {
+		emitError("bob wallet sweep", fmt.Errorf("agent %s has no local EVM private key", fromAgentID))
+		return nil
+	}
+	derivedFrom, derr := deriveEVMAddressFromPrivateKey(fromKeys.EVMPrivateKey)
+	if derr != nil {
+		emitError("bob wallet sweep", fmt.Errorf("failed to derive EVM address for %s: %w", fromAgentID, derr))
+		return nil
+	}
+	if addr := strings.TrimSpace(fromKeys.EVMAddress); addr != "" && !strings.EqualFold(addr, derivedFrom) {
+		emitError("bob wallet sweep", fmt.Errorf("configured EVM address %s does not match local private key for agent %s", addr, fromAgentID))
+		return nil
+	}
+	fromAddress := derivedFrom
+	if !common.IsHexAddress(fromAddress) {
+		emitError("bob wallet sweep", fmt.Errorf("invalid derived EVM address %q for agent %s", fromAddress, fromAgentID))
+		return nil
+	}
+
+	if strings.TrimSpace(toAddress) == "" {
+		if strings.TrimSpace(toAgentID) == "" {
+			emitError("bob wallet sweep", fmt.Errorf("set --to-agent-id or --to-address"))
+			return nil
+		}
+		toKeys := cfg.walletKeysForAgent(strings.TrimSpace(toAgentID))
+		if toKeys == nil {
+			emitError("bob wallet sweep", fmt.Errorf("no local keyring entry for agent %s", toAgentID))
+			return nil
+		}
+		toAddress = strings.TrimSpace(toKeys.EVMAddress)
+		if toAddress == "" && strings.TrimSpace(toKeys.EVMPrivateKey) != "" {
+			derived, derr := deriveEVMAddressFromPrivateKey(toKeys.EVMPrivateKey)
+			if derr != nil {
+				emitError("bob wallet sweep", fmt.Errorf("failed to derive destination EVM address for %s: %w", toAgentID, derr))
+				return nil
+			}
+			toAddress = derived
+		}
+	}
+	if !common.IsHexAddress(strings.TrimSpace(toAddress)) {
+		emitError("bob wallet sweep", fmt.Errorf("invalid --to-address %q", toAddress))
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(toAddress), strings.TrimSpace(fromAddress)) {
+		emitError("bob wallet sweep", fmt.Errorf("destination address must differ from source"))
+		return nil
+	}
+
+	leaveWei := big.NewInt(0)
+	if strings.TrimSpace(leaveWeiRaw) != "" {
+		if _, ok := leaveWei.SetString(strings.TrimSpace(leaveWeiRaw), 10); !ok || leaveWei.Sign() < 0 {
+			emitError("bob wallet sweep", fmt.Errorf("invalid --leave-wei %q", leaveWeiRaw))
+			return nil
+		}
+	}
+	maxWei := big.NewInt(0)
+	if strings.TrimSpace(maxWeiRaw) != "" {
+		if _, ok := maxWei.SetString(strings.TrimSpace(maxWeiRaw), 10); !ok || maxWei.Sign() < 0 {
+			emitError("bob wallet sweep", fmt.Errorf("invalid --max-wei %q (must be >= 0)", maxWeiRaw))
+			return nil
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(cmd.Context(), 45*time.Second)
+	defer cancel()
+	balance, balErr := evmBalanceAt(ctx, normalizedChainID, common.HexToAddress(fromAddress))
+	if balErr != nil {
+		emitError("bob wallet sweep", fmt.Errorf("balance lookup failed for %s: %w", fromAddress, balErr))
+		return nil
+	}
+
+	reserveWei := new(big.Int).Set(leaveWei)
+	minReserve := localGasFundingFeeBufferWei()
+	if reserveWei.Cmp(minReserve) < 0 {
+		reserveWei = minReserve
+	}
+
+	maxTransfer := new(big.Int).Sub(balance, reserveWei)
+	if maxTransfer.Sign() <= 0 {
+		emitError("bob wallet sweep", fmt.Errorf("insufficient balance: %s wei available with reserve=%s", balance.String(), reserveWei.String()))
+		return nil
+	}
+	if maxWei.Sign() > 0 && maxTransfer.Cmp(maxWei) > 0 {
+		maxTransfer = new(big.Int).Set(maxWei)
+	}
+
+	gasEstimateWei, gasErr := evmEstimateNativeTransferCost(ctx, normalizedChainID, common.HexToAddress(fromAddress), common.HexToAddress(toAddress), maxTransfer)
+	if gasErr != nil {
+		emitError("bob wallet sweep", fmt.Errorf("estimate gas failed: %w", gasErr))
+		return nil
+	}
+
+	transfer := new(big.Int).Sub(balance, reserveWei)
+	transfer.Sub(transfer, gasEstimateWei)
+	if transfer.Sign() <= 0 {
+		emitError("bob wallet sweep", fmt.Errorf("insufficient balance: %s wei available with reserve=%s and gas_estimate=%s", balance.String(), reserveWei.String(), gasEstimateWei.String()))
+		return nil
+	}
+	if maxWei.Sign() > 0 && transfer.Cmp(maxWei) > 0 {
+		transfer = new(big.Int).Set(maxWei)
+	}
+
+	if dryRun {
+		emit(Envelope{
+			OK:      true,
+			Command: "bob wallet sweep",
+			Data: map[string]any{
+				"chain_id":         normalizedChainID,
+				"asset":            "native",
+				"from_agent_id":    fromAgentID,
+				"from_address":     fromAddress,
+				"to_agent_id":      strings.TrimSpace(toAgentID),
+				"to_address":       toAddress,
+				"balance_wei":      balance.String(),
+				"leave_wei":        leaveWei.String(),
+				"reserve_wei":      reserveWei.String(),
+				"max_wei":          maxWei.String(),
+				"gas_estimate_wei": gasEstimateWei.String(),
+				"transfer_wei":     transfer.String(),
+				"transfer_native":  formatWeiAsNative(transfer, 18),
+				"dry_run":          true,
+			},
+			NextActions: []NextAction{
+				{Command: fmt.Sprintf("bob wallet sweep --from-agent-id %s --to-address %s --yes", fromAgentID, toAddress), Description: "Execute the sweep transfer"},
+				{Command: "bob wallet gas-candidates", Description: "Inspect other local wallets for gas funding"},
+			},
+		})
+		return nil
+	}
+
+	if !yes {
+		emitErrorWithActions("bob wallet sweep", fmt.Errorf("confirmation required: re-run with --yes to broadcast transfer"), []NextAction{
+			{Command: fmt.Sprintf("bob wallet sweep --from-agent-id %s --to-address %s --yes", fromAgentID, toAddress), Description: "Broadcast the sweep transfer"},
+			{Command: fmt.Sprintf("bob wallet sweep --from-agent-id %s --to-address %s --dry-run", fromAgentID, toAddress), Description: "Preview sweep amount before sending"},
+		})
+		return nil
+	}
+
+	ctxSend, cancelSend := context.WithTimeout(cmd.Context(), 120*time.Second)
+	defer cancelSend()
+	txHash, sendErr := evmSendNativeValue(ctxSend, fromKeys.EVMPrivateKey, normalizedChainID, common.HexToAddress(toAddress), transfer)
+	if sendErr != nil {
+		emitError("bob wallet sweep", fmt.Errorf("send failed: %w", sendErr))
+		return nil
+	}
+
+	nextActions := []NextAction{
+		{Command: "bob wallet gas-candidates", Description: "Inspect remaining local gas candidates"},
+	}
+	if strings.TrimSpace(toAgentID) != "" {
+		nextActions = append([]NextAction{
+			{Command: fmt.Sprintf("bob wallet onchain-balances --agent-id %s", strings.TrimSpace(toAgentID)), Description: "Check destination balance snapshot"},
+		}, nextActions...)
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob wallet sweep",
+		Data: map[string]any{
+			"chain_id":         normalizedChainID,
+			"asset":            "native",
+			"from_agent_id":    fromAgentID,
+			"from_address":     fromAddress,
+			"to_agent_id":      strings.TrimSpace(toAgentID),
+			"to_address":       toAddress,
+			"balance_wei":      balance.String(),
+			"leave_wei":        leaveWei.String(),
+			"reserve_wei":      reserveWei.String(),
+			"gas_estimate_wei": gasEstimateWei.String(),
+			"transfer_wei":     transfer.String(),
+			"transfer_native":  formatWeiAsNative(transfer, 18),
+			"tx_hash":          txHash.Hex(),
+		},
+		NextActions: nextActions,
 	})
 	return nil
 }

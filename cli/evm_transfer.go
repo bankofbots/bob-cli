@@ -20,6 +20,7 @@ import (
 
 var evmBalanceAt = evmNativeBalance
 var evmSendNativeValue = evmSendNative
+var evmEstimateNativeTransferCost = estimateNativeTransferCost
 
 // chainConfig holds per-chain token addresses and fallback RPC URLs.
 type chainConfig struct {
@@ -330,6 +331,42 @@ func evmNativeBalance(ctx context.Context, chainIDHex string, addr common.Addres
 		return nil, fmt.Errorf("read balance: %w", err)
 	}
 	return balance, nil
+}
+
+func estimateNativeTransferCost(ctx context.Context, chainIDHex string, from, to common.Address, value *big.Int) (*big.Int, error) {
+	rpcURL, err := rpcURLForChain(chainIDHex)
+	if err != nil {
+		return nil, err
+	}
+	client, err := ethclient.DialContext(ctx, rpcURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect to %s: %w", rpcURL, err)
+	}
+	defer client.Close()
+
+	estimatedGas, err := client.EstimateGas(ctx, ethereum.CallMsg{
+		From:  from,
+		To:    &to,
+		Value: value,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("estimate gas: %w", err)
+	}
+	gasLimit := estimatedGas + estimatedGas/5
+
+	gasTipCap, err := client.SuggestGasTipCap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get gas tip cap: %w", err)
+	}
+	head, err := client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get latest block header: %w", err)
+	}
+	if head.BaseFee == nil {
+		return nil, fmt.Errorf("chain does not support EIP-1559")
+	}
+	gasFeeCap := new(big.Int).Add(new(big.Int).Mul(head.BaseFee, big.NewInt(2)), gasTipCap)
+	return new(big.Int).Mul(gasFeeCap, new(big.Int).SetUint64(gasLimit)), nil
 }
 
 // runSendEVM handles `bob send evm --to <addr> --amount <atomic> [--token usdc|native]`.
