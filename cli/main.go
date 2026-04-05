@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.56.0"
+const version = "0.57.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -2247,7 +2247,9 @@ func initSession(cmd *cobra.Command, args []string) error {
 	apiURLFlag, _ := cmd.Flags().GetString("api-url")
 	showAPIKey, _ := cmd.Flags().GetBool("show-api-key")
 
-	var agentName string // populated from claim-code redeem or auth/me
+	var agentName string        // populated from claim-code redeem or auth/me
+	var custodyTier string      // populated from claim-code redeem response
+	var custodyTierWarning string // deferred warning if tier was unrecognized
 	var bobHandle string // populated from claim-code redeem
 	platform = strings.ToLower(strings.TrimSpace(platform))
 	if platform == "" {
@@ -2344,17 +2346,19 @@ func initSession(cmd *cobra.Command, args []string) error {
 		}
 
 		var redeemResp struct {
-			APIKey    string `json:"api_key"`
-			AgentID   string `json:"agent_id"`
-			AgentName string `json:"agent_name"`
-			BobHandle string `json:"bob_handle"`
-			APIURL    string `json:"api_url"`
-			Data      struct {
-				APIKey    string `json:"api_key"`
-				AgentID   string `json:"agent_id"`
-				AgentName string `json:"agent_name"`
-				BobHandle string `json:"bob_handle"`
-				APIURL    string `json:"api_url"`
+			APIKey      string `json:"api_key"`
+			AgentID     string `json:"agent_id"`
+			AgentName   string `json:"agent_name"`
+			BobHandle   string `json:"bob_handle"`
+			APIURL      string `json:"api_url"`
+			CustodyTier string `json:"custody_tier"`
+			Data        struct {
+				APIKey      string `json:"api_key"`
+				AgentID     string `json:"agent_id"`
+				AgentName   string `json:"agent_name"`
+				BobHandle   string `json:"bob_handle"`
+				APIURL      string `json:"api_url"`
+				CustodyTier string `json:"custody_tier"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(resp, &redeemResp); err != nil {
@@ -2375,6 +2379,18 @@ func initSession(cmd *cobra.Command, args []string) error {
 		}
 		if resolvedAPIURL != "" {
 			normalizedAPIBase = normalizeAPIBaseForEnv(resolvedAPIURL)
+		}
+
+		custodyTier = strings.TrimSpace(redeemResp.CustodyTier)
+		if custodyTier == "" {
+			custodyTier = strings.TrimSpace(redeemResp.Data.CustodyTier)
+		}
+		knownTiers := map[string]bool{"view_only": true, "operator_approved": true, "policy_controlled": true, "full_auto": true}
+		if custodyTier == "" || !knownTiers[custodyTier] {
+			if custodyTier != "" {
+				custodyTierWarning = fmt.Sprintf("unrecognized custody tier %q from server; defaulting to view_only", custodyTier)
+			}
+			custodyTier = "view_only"
 		}
 
 		if resolvedAPIKey == "" || resolvedAgentID == "" {
@@ -2436,6 +2452,9 @@ func initSession(cmd *cobra.Command, args []string) error {
 	}
 
 	warnings := []string{}
+	if custodyTierWarning != "" {
+		warnings = append(warnings, custodyTierWarning)
+	}
 	switch platform {
 	case "claude":
 		warnings = append(warnings, "initialized as platform=claude. If you intended OpenClaw, run: bob init switch-platform --platform openclaw")
@@ -2519,6 +2538,35 @@ func initSession(cmd *cobra.Command, args []string) error {
 		warnings = append(warnings, bindWarnings...)
 	}
 
+	// Deploy a 2-of-2 Safe for custody tiers that require it.
+	var safeDeployData map[string]any
+	if custodyTier == "operator_approved" || custodyTier == "policy_controlled" {
+		if walletResult.evmAddress != "" {
+			safeResp, safeErr := apiPostFn(
+				fmt.Sprintf("/agents/%s/treasury/deploy-safe", url.PathEscape(agentID)),
+				map[string]any{"agent_owner_address": walletResult.evmAddress},
+			)
+			if safeErr != nil {
+				warnings = append(warnings, "treasury safe deployment: "+extractAPIErrorMessage(safeErr))
+			} else {
+				var safeResult struct {
+					SafeAddress       string `json:"safe_address"`
+					TreasuryAccountID string `json:"treasury_account_id"`
+					DeploymentTxHash  string `json:"deployment_tx_hash"`
+				}
+				if json.Unmarshal(safeResp, &safeResult) == nil && safeResult.SafeAddress != "" {
+					safeDeployData = map[string]any{
+						"safe_address":        safeResult.SafeAddress,
+						"treasury_account_id": safeResult.TreasuryAccountID,
+						"deployment_tx_hash":  safeResult.DeploymentTxHash,
+					}
+				}
+			}
+		} else {
+			warnings = append(warnings, "treasury safe deployment skipped: no EVM address available")
+		}
+	}
+
 	apiBase = savedBase
 	apiKey = savedKey
 
@@ -2532,13 +2580,22 @@ func initSession(cmd *cobra.Command, args []string) error {
 		"api_key_hidden":   !shouldPrintAPIKey,
 		"api_url":          normalizedAPIBase,
 		"config_file":      activeCLIConfigPath(),
-		"warnings":         warnings,
 		"env":              envCommands,
 	}
 	if len(walletData) > 0 {
 		initData["wallets"] = walletData
 	}
-	warnings = append(warnings, "if this agent will spend autonomously, treasury should be provisioned and policy-enabled before sending funds; check with: bob treasury status --agent-id "+agentID)
+	if custodyTier != "" {
+		initData["custody_tier"] = custodyTier
+	}
+	if safeDeployData != nil {
+		for k, v := range safeDeployData {
+			initData[k] = v
+		}
+	}
+	if custodyTier == "view_only" || custodyTier == "" {
+		warnings = append(warnings, "if this agent will spend autonomously, treasury should be provisioned and policy-enabled before sending funds; check with: bob treasury status --agent-id "+agentID)
+	}
 
 	emit(Envelope{
 		OK:          true,
