@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.57.0"
+const version = "0.58.0"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -91,6 +91,9 @@ type cliConfig struct {
 	BTCAddress    string `json:"btc_address,omitempty"`
 	SOLPrivateKey string `json:"sol_private_key,omitempty"`
 	SOLAddress    string `json:"sol_address,omitempty"`
+
+	// Spend sync tracking
+	SpendSyncTimestamp string `json:"spend_sync_timestamp,omitempty"`
 }
 
 // migrateWalletKeyring moves legacy flat wallet keys into the per-agent keyring.
@@ -1064,7 +1067,10 @@ func apiGet(path string) (json.RawMessage, error) {
 }
 
 func apiPost(path string, payload any) (json.RawMessage, error) {
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
 	req, err := newRequest(http.MethodPost, path, bytes.NewReader(b))
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -1085,7 +1091,10 @@ func apiPost(path string, payload any) (json.RawMessage, error) {
 }
 
 func apiPatch(path string, payload any) (json.RawMessage, error) {
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
 	req, err := newRequest(http.MethodPatch, path, bytes.NewReader(b))
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -1106,7 +1115,10 @@ func apiPatch(path string, payload any) (json.RawMessage, error) {
 }
 
 func apiPut(path string, payload any) (json.RawMessage, error) {
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
 	req, err := newRequest(http.MethodPut, path, bytes.NewReader(b))
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -1158,7 +1170,10 @@ func newRequestNoAuth(method, path string, body io.Reader) (*http.Request, error
 }
 
 func apiPostNoAuth(path string, payload any) (json.RawMessage, error) {
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
 	req, err := newRequestNoAuth(http.MethodPost, path, bytes.NewReader(b))
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -1174,6 +1189,32 @@ func apiPostNoAuth(path string, payload any) (json.RawMessage, error) {
 	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("api error (%d): %s", resp.StatusCode, string(body))
+	}
+	return json.RawMessage(body), nil
+}
+
+// httpPostJSON performs a raw JSON POST to an arbitrary URL (no BOB API auth).
+func httpPostJSON(rawURL string, payload any) (json.RawMessage, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("http error (%d): %s", resp.StatusCode, string(body))
 	}
 	return json.RawMessage(body), nil
 }
@@ -2047,6 +2088,7 @@ func main() {
 	root.AddCommand(registerCmd())
 	root.AddCommand(walletCmd())
 	root.AddCommand(treasuryCmd())
+	root.AddCommand(spendCmd())
 	root.AddCommand(loanCmd())
 	root.AddCommand(sendCmd())
 	root.AddCommand(updateCmd())

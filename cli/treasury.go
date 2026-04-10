@@ -69,7 +69,7 @@ func treasuryCmd() *cobra.Command {
 				OK:      true,
 				Command: "bob treasury",
 				Data: map[string]any{
-					"subcommands": []string{"status", "prepare", "sign", "submit", "transfer", "requests"},
+					"subcommands": []string{"status", "deploy-safe", "prepare", "sign", "submit", "transfer", "requests"},
 				},
 				NextActions: []NextAction{
 					{Command: "bob treasury status", Description: "Show treasury accounts and active policy"},
@@ -156,6 +156,15 @@ func treasuryCmd() *cobra.Command {
 	_ = transferCmd.MarkFlagRequired("to")
 	_ = transferCmd.MarkFlagRequired("amount")
 	cmd.AddCommand(transferCmd)
+
+	deploySafeCmd := &cobra.Command{
+		Use:   "deploy-safe",
+		Short: "Deploy a 2-of-2 treasury Safe for this agent",
+		Long:  "Deploy a Gnosis Safe on Base with the agent as owner #1 and BOB as owner #2. Requires an EVM wallet in the local keyring.",
+		RunE:  runTreasuryDeploySafe,
+	}
+	deploySafeCmd.Flags().String("agent-id", "", "Agent ID")
+	cmd.AddCommand(deploySafeCmd)
 
 	return cmd
 }
@@ -475,6 +484,65 @@ func emitTreasuryFlowError(command string, err error, prepared *treasuryPrepareR
 			{Command: "bob treasury submit --reservation-id " + prepared.ReservationID + " --to " + toAddress + " --amount " + amountAtomic + " --signature <sig> --agent-id " + agentID, Description: "Submit the existing prepared treasury request without reserving a new nonce"},
 		},
 	})
+}
+
+func runTreasuryDeploySafe(cmd *cobra.Command, args []string) error {
+	agentID := resolveAgentID(cmd)
+	if agentID == "" {
+		emitErrorWithActions("bob treasury deploy-safe", fmt.Errorf("no agent ID"), noAgentIDActions)
+		return nil
+	}
+
+	cfg, err := loadCLIConfigFn()
+	if err != nil {
+		emitError("bob treasury deploy-safe", fmt.Errorf("failed to load config: %w", err))
+		return nil
+	}
+	keys := cfg.walletKeysForAgent(agentID)
+	if keys == nil {
+		keys = cfg.activeWalletKeys()
+	}
+	if keys == nil || strings.TrimSpace(keys.EVMAddress) == "" {
+		emitError("bob treasury deploy-safe", fmt.Errorf("no EVM wallet found for agent %s — run 'bob init' first", agentID))
+		return nil
+	}
+
+	resp, err := apiPostFn(
+		fmt.Sprintf("/agents/%s/treasury/deploy-safe", url.PathEscape(agentID)),
+		map[string]any{"agent_owner_address": keys.EVMAddress},
+	)
+	if err != nil {
+		emitError("bob treasury deploy-safe", err)
+		return nil
+	}
+
+	var result struct {
+		SafeAddress       string `json:"safe_address"`
+		TreasuryAccountID string `json:"treasury_account_id"`
+		DeploymentTxHash  string `json:"deployment_tx_hash"`
+		CustodyTier       string `json:"custody_tier"`
+	}
+	if unmarshalErr := json.Unmarshal(resp, &result); unmarshalErr != nil {
+		emitError("bob treasury deploy-safe", fmt.Errorf("failed to parse response: %w", unmarshalErr))
+		return nil
+	}
+
+	emit(Envelope{
+		OK:      true,
+		Command: "bob treasury deploy-safe",
+		Data: map[string]any{
+			"safe_address":        result.SafeAddress,
+			"treasury_account_id": result.TreasuryAccountID,
+			"deployment_tx_hash":  result.DeploymentTxHash,
+			"custody_tier":        result.CustodyTier,
+			"agent_owner_address": keys.EVMAddress,
+		},
+		NextActions: []NextAction{
+			{Command: "bob treasury status --agent-id " + agentID, Description: "Verify treasury account and policy"},
+			{Command: "bob treasury transfer --account-id " + result.TreasuryAccountID + " --to <address> --amount <atomic>", Description: "Send USDC from treasury"},
+		},
+	})
+	return nil
 }
 
 // signTreasuryHashForAgent signs the raw 32-byte safeTxHash digest (no EIP-191 prefix).
