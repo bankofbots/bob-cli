@@ -159,8 +159,8 @@ func treasuryCmd() *cobra.Command {
 
 	deploySafeCmd := &cobra.Command{
 		Use:   "deploy-safe",
-		Short: "Deploy a 2-of-2 treasury Safe for this agent",
-		Long:  "Deploy a Gnosis Safe on Base with the agent as owner #1 and BOB as owner #2. Requires an EVM wallet in the local keyring.",
+		Short: "Deploy a 2-of-3 treasury Safe for this agent",
+		Long:  "Deploy a Gnosis Safe on Base with the agent as owner #1, operator recovery key as owner #2, and BOB as owner #3. Requires an EVM wallet in the local keyring and a registered operator recovery key.",
 		RunE:  runTreasuryDeploySafe,
 	}
 	deploySafeCmd.Flags().String("agent-id", "", "Agent ID")
@@ -224,11 +224,11 @@ func runTreasuryStatus(cmd *cobra.Command, args []string) error {
 func treasurySetupGuidance(hasAccount bool, hasPolicy bool) string {
 	switch {
 	case !hasAccount && !hasPolicy:
-		return "Treasury is not provisioned yet. For any agent that will spend autonomously, have your operator provision a 2-of-2 Safe and activate a treasury policy before funding it."
+		return "Treasury is not provisioned yet. For any agent that will spend autonomously, have your operator generate a recovery key in the dashboard, provision a 2-of-3 Safe, and activate a treasury policy before funding it."
 	case hasAccount && !hasPolicy:
 		return "Treasury account exists but no active policy is attached. Spending should stay disabled until your operator activates a treasury policy."
 	case !hasAccount && hasPolicy:
-		return "Treasury policy exists but no treasury account is provisioned. Spending should stay disabled until the 2-of-2 Safe is created."
+		return "Treasury policy exists but no treasury account is provisioned. Spending should stay disabled until the 2-of-3 Safe is created."
 	default:
 		return "Treasury is provisioned. Use treasury transfers for governed agent spending."
 	}

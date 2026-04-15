@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.58.0"
+const version = "0.58.1"
 
 const defaultAPIBase = "https://api.bankofbots.ai/api/v1"
 
@@ -2580,7 +2580,7 @@ func initSession(cmd *cobra.Command, args []string) error {
 		warnings = append(warnings, bindWarnings...)
 	}
 
-	// Deploy a 2-of-2 Safe for custody tiers that require it.
+	// Deploy a 2-of-3 Safe for custody tiers that require it.
 	var safeDeployData map[string]any
 	if custodyTier == "operator_approved" || custodyTier == "policy_controlled" {
 		if walletResult.evmAddress != "" {
@@ -2833,7 +2833,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 				treasuryResult["ready_for_spending"] = ready
 				treasuryResult["ok"] = true
 				if !ready {
-					warnings = append(warnings, "treasury is not ready for governed spending; before enabling autonomous payments, provision a 2-of-2 treasury account and active policy")
+					warnings = append(warnings, "treasury is not ready for governed spending; operator must generate a recovery key in the dashboard, then provision a 2-of-3 treasury account and active policy")
 				}
 			}
 		}
@@ -5907,8 +5907,18 @@ func registerWalletBestEffort(agentID, rail, address string) string {
 		return ""
 	}
 
+	fmt.Fprintf(os.Stderr, "  wallet-register %s: FAILED — %s\n", rail, err.Error())
+	return classifyWalletRegisterError(rail, err)
+}
+
+// classifyWalletRegisterError maps a wallet-registration error into a
+// user-facing warning string. Empty string = suppress (409 duplicate on
+// re-init). Kept as a pure function so the mapping is unit-testable.
+func classifyWalletRegisterError(rail string, err error) string {
+	if err == nil {
+		return ""
+	}
 	errStr := err.Error()
-	fmt.Fprintf(os.Stderr, "  wallet-register %s: FAILED — %s\n", rail, errStr)
 
 	// 409 (duplicate) is expected on re-init — don't warn
 	if strings.Contains(errStr, "409") {
@@ -5922,9 +5932,15 @@ func registerWalletBestEffort(agentID, rail, address string) string {
 	if strings.Contains(errStr, "401") {
 		return fmt.Sprintf("%s: wallet registration auth failed (401) — API key may not be valid for this agent", rail)
 	}
-	// 400 = bad request (e.g., missing signature)
+	// 400 = bad request (e.g., missing signature, missing recovery key)
 	if strings.Contains(errStr, "400") {
-		return fmt.Sprintf("%s: wallet registration bad request (400) — %s", rail, extractAPIErrorMessage(err))
+		msg := extractAPIErrorMessage(err)
+		// Operator needs to generate a recovery key in the dashboard before init can complete.
+		// Case-insensitive so we catch any capitalization variant the API might return.
+		if strings.Contains(strings.ToLower(msg), "recovery key") {
+			return fmt.Sprintf("%s: %s\n    → Have the operator visit the dashboard and generate a recovery key, then retry 'bob init'", rail, msg)
+		}
+		return fmt.Sprintf("%s: wallet registration bad request (400) — %s", rail, msg)
 	}
 	return fmt.Sprintf("%s: %s", rail, extractAPIErrorMessage(err))
 }

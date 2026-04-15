@@ -361,7 +361,7 @@ func TestRunTreasuryStatus_ShowsSpendingGuidanceWhenTreasuryMissing(t *testing.T
 		t.Fatal("expected treasury_required_for_spending to be true")
 	}
 	guidance, _ := data["treasury_setup_guidance"].(string)
-	if !strings.Contains(guidance, "2-of-2 Safe") {
+	if !strings.Contains(guidance, "2-of-3 Safe") {
 		t.Fatalf("unexpected guidance: %q", guidance)
 	}
 }
